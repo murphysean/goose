@@ -279,12 +279,13 @@ mod tests {
     use tempfile::tempdir;
 
     fn ctx() -> PlatformExtensionContext {
+        let (job_registry, _) = crate::jobs::create_job_registry();
         PlatformExtensionContext {
             extension_manager: None,
             session_manager: Arc::new(SessionManager::new(std::env::temp_dir())),
             session: None,
             use_login_shell_path: false,
-            job_registry: None,
+            job_registry,
         }
     }
 

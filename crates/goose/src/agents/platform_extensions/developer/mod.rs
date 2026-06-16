@@ -262,12 +262,13 @@ mod tests {
     }
 
     fn test_context(data_dir: std::path::PathBuf) -> PlatformExtensionContext {
+        let (job_registry, _) = crate::jobs::create_job_registry();
         PlatformExtensionContext {
             extension_manager: None,
             session_manager: Arc::new(SessionManager::new(data_dir)),
             session: None,
             use_login_shell_path: false,
-            job_registry: None,
+            job_registry,
         }
     }
 

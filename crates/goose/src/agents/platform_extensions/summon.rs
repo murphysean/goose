@@ -1633,13 +1633,11 @@ impl SummonClient {
             );
 
             // Update job registry
-            if let Some(ref registry) = self.context.job_registry {
-                let is_success = completed.get(&id).is_some_and(|t| t.result.is_ok());
-                if is_success {
-                    registry.lock().await.complete(&id, None);
-                } else {
-                    registry.lock().await.fail(&id, None);
-                }
+            let is_success = completed.get(&id).is_some_and(|t| t.result.is_ok());
+            if is_success {
+                self.context.job_registry.lock().await.complete(&id, None);
+            } else {
+                self.context.job_registry.lock().await.fail(&id, None);
             }
         }
     }
@@ -1748,8 +1746,10 @@ impl SummonClient {
             Arc::clone(&notification_buffer),
         );
 
+        let (done_tx, done_rx) = tokio::sync::oneshot::channel::<()>();
+
         let handle = tokio::spawn(async move {
-            run_subagent_task(SubagentRunParams {
+            let result = run_subagent_task(SubagentRunParams {
                 config: agent_config,
                 recipe,
                 task_config,
@@ -1759,7 +1759,9 @@ impl SummonClient {
                 on_message: Some(on_message),
                 notification_tx: Some(notif_tx),
             })
-            .await
+            .await;
+            let _ = done_tx.send(());
+            result
         });
 
         let task = BackgroundTask {
@@ -1780,48 +1782,34 @@ impl SummonClient {
             .insert(task_id.clone(), task);
 
         // Register in the unified job registry
-        if let Some(ref registry) = self.context.job_registry {
-            let job = crate::jobs::Job {
-                id: task_id.clone(),
-                source: crate::jobs::JobSource::Subagent,
-                description: description.clone(),
-                state: crate::jobs::JobState::Working,
-                batch_id: None,
-                notify_policy: crate::jobs::NotifyPolicy::OnCompletion,
-                meta: crate::jobs::JobMeta::default(),
-                created_at: std::time::Instant::now(),
-                last_activity: std::time::Instant::now(),
-                notifications: Vec::new(),
-                result_summary: None,
-            };
-            registry.lock().await.register(job);
+        let job = crate::jobs::Job {
+            id: task_id.clone(),
+            source: crate::jobs::JobSource::Subagent,
+            description: description.clone(),
+            state: crate::jobs::JobState::Working,
+            batch_id: None,
+            notify_policy: crate::jobs::NotifyPolicy::OnCompletion,
+            meta: crate::jobs::JobMeta::default(),
+            created_at: std::time::Instant::now(),
+            last_activity: std::time::Instant::now(),
+            worked_duration: std::time::Duration::default(),
+            notifications: Vec::new(),
+            result_summary: None,
+        };
+        self.context.job_registry.lock().await.register(job);
 
-            // Spawn watcher to drive job completion when the delegate finishes.
-            // We poll the JoinHandle via a separate spawned task that holds nothing
-            // from self — just the registry and a handle to the spawned future.
-            let registry_clone = Arc::clone(registry);
-            let watcher_id = task_id.clone();
-            let watcher_handle = {
-                let tasks = self.background_tasks.lock().await;
-                let task_ref = tasks.get(&watcher_id).unwrap();
-                task_ref.handle.abort_handle()
-            };
-            tokio::spawn(async move {
-                // Poll until the task finishes (abort handle lets us check without owning)
-                loop {
-                    tokio::time::sleep(std::time::Duration::from_millis(500)).await;
-                    if watcher_handle.is_finished() {
-                        let mut reg = registry_clone.lock().await;
-                        if let Some(job) = reg.get(&watcher_id) {
-                            if !job.state.is_terminal() {
-                                reg.complete(&watcher_id, None);
-                            }
-                        }
-                        break;
-                    }
+        // Spawn watcher that awaits task completion via oneshot (no polling).
+        let registry_clone = Arc::clone(&self.context.job_registry);
+        let watcher_id = task_id.clone();
+        tokio::spawn(async move {
+            let _ = done_rx.await;
+            let mut reg = registry_clone.lock().await;
+            if let Some(job) = reg.get(&watcher_id) {
+                if !job.state.is_terminal() {
+                    reg.complete(&watcher_id, None);
                 }
-            });
-        }
+            }
+        });
 
         let content = vec![Content::text(format!(
             "Task {} started in background: \"{}\"\n\
@@ -1988,12 +1976,13 @@ mod tests {
     use tempfile::TempDir;
 
     fn create_test_context() -> PlatformExtensionContext {
+        let (job_registry, _) = crate::jobs::create_job_registry();
         PlatformExtensionContext {
             extension_manager: None,
             session_manager: Arc::new(crate::session::SessionManager::instance()),
             session: None,
             use_login_shell_path: false,
-            job_registry: None,
+            job_registry,
         }
     }
 

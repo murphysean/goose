@@ -228,7 +228,7 @@ pub struct PlatformExtensionContext {
     pub session_manager: std::sync::Arc<crate::session::SessionManager>,
     pub session: Option<std::sync::Arc<Session>>,
     pub use_login_shell_path: bool,
-    pub job_registry: Option<crate::jobs::SharedJobRegistry>,
+    pub job_registry: crate::jobs::SharedJobRegistry,
 }
 
 impl PlatformExtensionContext {

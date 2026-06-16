@@ -139,6 +139,9 @@ pub struct Job {
     pub meta: JobMeta,
     pub created_at: Instant,
     pub last_activity: Instant,
+    /// Accumulated wall-clock time spent in Working state.
+    /// Updated when transitioning out of Working or into InputRequired.
+    pub worked_duration: Duration,
     pub notifications: Vec<JobNotification>,
     pub result_summary: Option<String>,
 }
@@ -221,6 +224,9 @@ impl JobRegistry {
     /// Transition a job to InputRequired and emit event.
     pub fn needs_input(&mut self, id: &str, question: String) {
         if let Some(job) = self.jobs.get_mut(id) {
+            if job.state == JobState::Working {
+                job.worked_duration += job.last_activity.elapsed();
+            }
             job.state = JobState::InputRequired;
             job.last_activity = Instant::now();
             if job.meta.interrupt_on.on_input_required {
@@ -307,40 +313,37 @@ impl JobRegistry {
     }
 
     fn transition(&mut self, id: &str, new_state: JobState, summary: Option<String>) {
-        let (notify_policy, batch_id, should_interrupt) = {
-            let Some(job) = self.jobs.get_mut(id) else {
-                return;
-            };
-            if job.state.is_terminal() {
-                return;
-            }
-            job.state = new_state.clone();
-            job.last_activity = Instant::now();
-            job.result_summary = summary;
-            let should_interrupt = match &new_state {
-                JobState::Completed => job.meta.interrupt_on.on_complete,
-                JobState::Failed => job.meta.interrupt_on.on_failed,
-                _ => false,
-            };
-            (
-                job.notify_policy.clone(),
-                job.batch_id.clone(),
-                should_interrupt,
-            )
+        let Some(job) = self.jobs.get_mut(id) else {
+            return;
+        };
+        if job.state.is_terminal() {
+            return;
+        }
+
+        // Accumulate worked duration when transitioning out of Working
+        if job.state == JobState::Working {
+            job.worked_duration += job.last_activity.elapsed();
+        }
+
+        job.state = new_state.clone();
+        job.last_activity = Instant::now();
+        job.result_summary = summary;
+
+        let should_interrupt = match &new_state {
+            JobState::Completed => job.meta.interrupt_on.on_complete,
+            JobState::Failed => job.meta.interrupt_on.on_failed,
+            _ => false,
         };
 
-        match notify_policy {
+        match &job.notify_policy {
             NotifyPolicy::OnCompletion => {
                 if should_interrupt {
-                    if let Some(job) = self.jobs.get(id) {
-                        let _ = self.event_tx.send(JobEvent::JobCompleted {
-                            job: self.make_summary(job),
-                        });
-                    }
+                    let summary = make_job_summary(job);
+                    let _ = self.event_tx.send(JobEvent::JobCompleted { job: summary });
                 }
             }
             NotifyPolicy::OnBatchCompletion => {
-                if let Some(batch_id) = batch_id {
+                if let Some(batch_id) = job.batch_id.clone() {
                     self.check_batch_completion(&batch_id);
                 }
             }
@@ -363,22 +366,30 @@ impl JobRegistry {
 
         if all_done {
             let summaries: Vec<JobSummary> =
-                batch_jobs.iter().map(|j| self.make_summary(j)).collect();
+                batch_jobs.iter().copied().map(make_job_summary).collect();
             let _ = self.event_tx.send(JobEvent::BatchCompleted {
                 batch_id: batch_id.to_string(),
                 job_summaries: summaries,
             });
         }
     }
+}
 
-    fn make_summary(&self, job: &Job) -> JobSummary {
-        JobSummary {
-            id: job.id.clone(),
-            source: job.source.clone(),
-            description: job.description.clone(),
-            state: job.state.clone(),
-            duration: job.created_at.elapsed(),
-        }
+/// Build a summary snapshot from a job, measuring worked duration.
+/// Exists as a free function so it can be called inside a mutable borrow of JobRegistry.
+pub fn make_job_summary(job: &Job) -> JobSummary {
+    let duration = if job.state == JobState::Working {
+        // Still working - account for time since last activity
+        job.worked_duration + job.last_activity.elapsed()
+    } else {
+        job.worked_duration
+    };
+    JobSummary {
+        id: job.id.clone(),
+        source: job.source.clone(),
+        description: job.description.clone(),
+        state: job.state.clone(),
+        duration,
     }
 }
 

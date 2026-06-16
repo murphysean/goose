@@ -35,7 +35,7 @@ use super::types::SharedProvider;
 use crate::agents::extension::{Envs, ProcessExit};
 use crate::agents::extension_malware_check;
 use crate::agents::mcp_client::{
-    GooseMcpClientCapabilities, GooseMcpHostInfo, McpClient, McpClientTrait,
+    ConnectionOptions, GooseMcpClientCapabilities, GooseMcpHostInfo, McpClient, McpClientTrait,
 };
 use crate::builtin_extension::get_builtin_extension;
 use crate::config::extensions::name_to_key;
@@ -341,10 +341,7 @@ async fn child_process_client(
     docker_container: Option<String>,
     client_name: String,
     capabilities: GooseMcpClientCapabilities,
-    notification_broadcast: Option<
-        tokio::sync::broadcast::Sender<(String, rmcp::model::ServerNotification)>,
-    >,
-    extension_name: Option<String>,
+    opts: ConnectionOptions,
 ) -> ExtensionResult<McpClient> {
     configure_subprocess(&mut command);
 
@@ -383,8 +380,7 @@ async fn child_process_client(
         client_name,
         capabilities,
         working_dir.clone(),
-        notification_broadcast,
-        extension_name,
+        opts,
     )
     .await;
 
@@ -567,8 +563,11 @@ async fn connect_with_auth(
             client_name,
             capabilities,
             roots_dir.to_path_buf(),
-            notification_broadcast,
-            None,
+            ConnectionOptions {
+                notification_broadcast,
+                extension_name: None,
+                docker_container: None,
+            },
         )
         .await?,
     ))
@@ -671,6 +670,11 @@ async fn create_streamable_http_client(
         }
     }
 
+    let opts = ConnectionOptions {
+        notification_broadcast: notification_broadcast.clone(),
+        extension_name: Some(name.to_string()),
+        docker_container: None,
+    };
     let client_res = McpClient::connect_with_options(
         transport,
         timeout_duration,
@@ -679,8 +683,7 @@ async fn create_streamable_http_client(
         client_name.clone(),
         capabilities.clone(),
         roots_dir.to_path_buf(),
-        notification_broadcast.clone(),
-        Some(name.to_string()),
+        opts,
     )
     .await;
 
@@ -760,8 +763,11 @@ async fn create_unix_socket_http_client(
         client_name.clone(),
         capabilities.clone(),
         roots_dir.to_path_buf(),
-        notification_broadcast,
-        Some(name.to_string()),
+        ConnectionOptions {
+            notification_broadcast,
+            extension_name: Some(name.to_string()),
+            docker_container: None,
+        },
     )
     .await;
 
@@ -800,7 +806,7 @@ impl ExtensionManager {
                 session_manager,
                 session: None,
                 use_login_shell_path,
-                job_registry: Some(job_registry),
+                job_registry,
             },
             provider,
             tools_cache: Mutex::new(None),
@@ -987,8 +993,11 @@ impl ExtensionManager {
                             Some(container_id.to_string()),
                             self.client_name.clone(),
                             self.mcp_client_capabilities(),
-                            Some(self.notification_broadcast.clone()),
-                            Some(sanitized_name.clone()),
+                            ConnectionOptions {
+                                notification_broadcast: Some(self.notification_broadcast.clone()),
+                                extension_name: Some(sanitized_name.clone()),
+                                docker_container: Some(container_id.to_string()),
+                            },
                         )
                         .await?;
                         Box::new(client)
@@ -1006,8 +1015,13 @@ impl ExtensionManager {
                                 self.client_name.clone(),
                                 self.mcp_client_capabilities(),
                                 effective_working_dir.clone(),
-                                Some(self.notification_broadcast.clone()),
-                                Some(sanitized_name.clone()),
+                                ConnectionOptions {
+                                    notification_broadcast: Some(
+                                        self.notification_broadcast.clone(),
+                                    ),
+                                    extension_name: Some(sanitized_name.clone()),
+                                    docker_container: None,
+                                },
                             )
                             .await?,
                         )
@@ -1064,8 +1078,11 @@ impl ExtensionManager {
                     container.map(|c| c.id().to_string()),
                     self.client_name.clone(),
                     self.mcp_client_capabilities(),
-                    Some(self.notification_broadcast.clone()),
-                    Some(sanitized_name.clone()),
+                    ConnectionOptions {
+                        notification_broadcast: Some(self.notification_broadcast.clone()),
+                        extension_name: Some(sanitized_name.clone()),
+                        docker_container: container.map(|c| c.id().to_string()),
+                    },
                 )
                 .await?;
                 Box::new(client)
@@ -1098,8 +1115,11 @@ impl ExtensionManager {
                     container.map(|c| c.id().to_string()),
                     self.client_name.clone(),
                     self.mcp_client_capabilities(),
-                    Some(self.notification_broadcast.clone()),
-                    Some(sanitized_name.clone()),
+                    ConnectionOptions {
+                        notification_broadcast: Some(self.notification_broadcast.clone()),
+                        extension_name: Some(sanitized_name.clone()),
+                        docker_container: container.map(|c| c.id().to_string()),
+                    },
                 )
                 .await?;
 

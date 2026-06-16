@@ -503,6 +503,15 @@ pub struct McpClient {
     docker_container: Option<String>,
 }
 
+/// Optional configuration for MCP client connections.
+#[derive(Default)]
+pub struct ConnectionOptions {
+    pub notification_broadcast:
+        Option<tokio::sync::broadcast::Sender<(String, ServerNotification)>>,
+    pub extension_name: Option<String>,
+    pub docker_container: Option<String>,
+}
+
 impl McpClient {
     pub async fn connect<T, E, A>(
         transport: T,
@@ -549,8 +558,7 @@ impl McpClient {
             client_name,
             capabilities,
             working_dir,
-            None,
-            None,
+            ConnectionOptions::default(),
         )
         .await
     }
@@ -564,10 +572,7 @@ impl McpClient {
         client_name: String,
         capabilities: GooseMcpClientCapabilities,
         working_dir: PathBuf,
-        notification_broadcast: Option<
-            tokio::sync::broadcast::Sender<(String, ServerNotification)>,
-        >,
-        extension_name: Option<String>,
+        opts: ConnectionOptions,
     ) -> Result<Self, ClientInitializeError>
     where
         T: IntoTransport<RoleClient, E, A>,
@@ -583,8 +588,8 @@ impl McpClient {
             capabilities.clone(),
             working_dir,
         );
-        if let Some(broadcast) = notification_broadcast {
-            let ext_name = extension_name.unwrap_or_else(|| client_name.clone());
+        if let Some(broadcast) = opts.notification_broadcast {
+            let ext_name = opts.extension_name.unwrap_or_else(|| client_name.clone());
             client = client.with_notification_broadcast(broadcast, ext_name);
         }
         let client: rmcp::service::RunningService<rmcp::RoleClient, GooseClient> =

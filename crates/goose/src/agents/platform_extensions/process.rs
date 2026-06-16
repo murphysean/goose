@@ -23,6 +23,7 @@ struct ManagedProcess {
     child: Child,
     stdin: Option<tokio::process::ChildStdin>,
     output_lines: Arc<Mutex<Vec<String>>>,
+    #[allow(dead_code)]
     description: String,
 }
 
@@ -101,13 +102,11 @@ impl ProcessClient {
                         if let Some(ref pat) = pattern {
                             if line.contains(pat.as_str()) {
                                 pattern_fired = true;
-                                if let Some(ref reg) = registry {
-                                    reg.lock().await.pattern_matched(
-                                        &job_id,
-                                        pat.clone(),
-                                        line.clone(),
-                                    );
-                                }
+                                registry.lock().await.pattern_matched(
+                                    &job_id,
+                                    pat.clone(),
+                                    line.clone(),
+                                );
                             }
                         }
                     }
@@ -128,35 +127,33 @@ impl ProcessClient {
         }
 
         // Spawn completion watcher — waits for stdout to close then marks job complete/failed
-        if let Some(ref registry) = self.context.job_registry {
-            let registry = Arc::clone(registry);
-            let job_id = id.clone();
-            let processes = Arc::clone(&self.processes);
-            tokio::spawn(async move {
-                let _ = stdout_done_rx.await;
-                // Small delay to let stderr drain and child to exit
-                tokio::time::sleep(std::time::Duration::from_millis(200)).await;
-                // Try to get exit code from the child
-                let code = {
-                    let mut procs = processes.lock().await;
-                    if let Some(proc) = procs.get_mut(&job_id) {
-                        proc.child.try_wait().ok().flatten().and_then(|s| s.code())
+        let registry = Arc::clone(&self.context.job_registry);
+        let job_id = id.clone();
+        let processes = Arc::clone(&self.processes);
+        tokio::spawn(async move {
+            let _ = stdout_done_rx.await;
+            // Small delay to let stderr drain and child to exit
+            tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+            // Try to get exit code from the child
+            let code = {
+                let mut procs = processes.lock().await;
+                if let Some(proc) = procs.get_mut(&job_id) {
+                    proc.child.try_wait().ok().flatten().and_then(|s| s.code())
+                } else {
+                    None
+                }
+            };
+            let mut reg = registry.lock().await;
+            if let Some(job) = reg.get(&job_id) {
+                if !job.state.is_terminal() {
+                    if code.unwrap_or(0) == 0 {
+                        reg.complete(&job_id, None);
                     } else {
-                        None
-                    }
-                };
-                let mut reg = registry.lock().await;
-                if let Some(job) = reg.get(&job_id) {
-                    if !job.state.is_terminal() {
-                        if code.unwrap_or(0) == 0 {
-                            reg.complete(&job_id, None);
-                        } else {
-                            reg.fail(&job_id, Some(format!("exit code: {}", code.unwrap_or(-1))));
-                        }
+                        reg.fail(&job_id, Some(format!("exit code: {}", code.unwrap_or(-1))));
                     }
                 }
-            });
-        }
+            }
+        });
 
         let description = if command.len() > 60 {
             format!("{}...", &command.chars().take(60).collect::<String>())
@@ -165,22 +162,22 @@ impl ProcessClient {
         };
 
         // Register in job registry BEFORE watcher can fire
-        if let Some(ref registry) = self.context.job_registry {
-            let job = Job {
-                id: id.clone(),
-                source: JobSource::Process,
-                description: description.clone(),
-                state: JobState::Working,
-                batch_id: None,
-                notify_policy: NotifyPolicy::OnCompletion,
-                meta: crate::jobs::JobMeta::default(),
-                created_at: std::time::Instant::now(),
-                last_activity: std::time::Instant::now(),
-                notifications: Vec::new(),
-                result_summary: None,
-            };
-            registry.lock().await.register(job);
-        }
+        let registry = Arc::clone(&self.context.job_registry);
+        let job = Job {
+            id: id.clone(),
+            source: JobSource::Process,
+            description: description.clone(),
+            state: JobState::Working,
+            batch_id: None,
+            notify_policy: NotifyPolicy::OnCompletion,
+            meta: crate::jobs::JobMeta::default(),
+            created_at: std::time::Instant::now(),
+            last_activity: std::time::Instant::now(),
+            worked_duration: std::time::Duration::default(),
+            notifications: Vec::new(),
+            result_summary: None,
+        };
+        registry.lock().await.register(job);
 
         let managed = ManagedProcess {
             child,
@@ -295,25 +292,20 @@ impl ProcessClient {
             let status = proc.child.wait().await.ok();
             let exit_code = status.and_then(|s| s.code());
 
-            if let Some(ref registry) = self.context.job_registry {
-                registry.lock().await.cancel(process_id);
-            }
+            self.context.job_registry.lock().await.cancel(process_id);
 
             Ok(CallToolResult::success(vec![Content::text(format!(
                 "Process {} stopped. Exit code: {:?}",
                 process_id, exit_code
             ))]))
         } else {
-            drop(processes);
-            if let Some(ref registry) = self.context.job_registry {
-                let mut reg = registry.lock().await;
-                if reg.get(process_id).is_some() {
-                    reg.cancel(process_id);
-                    return Ok(CallToolResult::success(vec![Content::text(format!(
-                        "Job {} canceled.",
-                        process_id
-                    ))]));
-                }
+            let mut reg = self.context.job_registry.lock().await;
+            if reg.get(process_id).is_some() {
+                reg.cancel(process_id);
+                return Ok(CallToolResult::success(vec![Content::text(format!(
+                    "Job {} canceled.",
+                    process_id
+                ))]));
             }
             Err(format!("Job '{}' not found", process_id))
         }
@@ -334,20 +326,15 @@ impl ProcessClient {
             .ok_or("Missing 'message' argument")?
             .to_string();
 
-        let duration = parse_duration(delay_str)
-            .ok_or_else(|| format!("Invalid delay '{}'. Use e.g. 30s, 5m, 2h, 1h30m", delay_str))?;
+        let duration = humantime::parse_duration(delay_str)
+            .map_err(|e| format!("Invalid delay '{}': {}", delay_str, e))?;
 
         let mut id_lock = self.next_id.lock().await;
         let id = format!("timer_{}", *id_lock);
         *id_lock += 1;
         drop(id_lock);
 
-        let registry = self
-            .context
-            .job_registry
-            .as_ref()
-            .ok_or("Job registry not available")?;
-
+        let registry = &self.context.job_registry;
         let deadline = std::time::Instant::now() + duration;
         let job = Job {
             id: id.clone(),
@@ -362,6 +349,7 @@ impl ProcessClient {
             },
             created_at: std::time::Instant::now(),
             last_activity: std::time::Instant::now(),
+            worked_duration: std::time::Duration::default(),
             notifications: Vec::new(),
             result_summary: None,
         };
@@ -374,7 +362,7 @@ impl ProcessClient {
             reg.lock().await.complete(&job_id, Some(message));
         });
 
-        let human_dur = format_duration(duration);
+        let human_dur = humantime::format_duration(duration);
         Ok(CallToolResult::success(vec![Content::text(format!(
             "Reminder scheduled: {} (fires in {}). Job ID: {}",
             args.get("message").unwrap().as_str().unwrap(),
@@ -384,11 +372,7 @@ impl ProcessClient {
     }
 
     async fn handle_list_jobs(&self) -> Result<CallToolResult, String> {
-        let registry = self
-            .context
-            .job_registry
-            .as_ref()
-            .ok_or("Job registry not available")?;
+        let registry = &self.context.job_registry;
 
         let reg = registry.lock().await;
         let jobs = reg.running();
@@ -407,7 +391,10 @@ impl ProcessClient {
                         if let Some(deadline) = j.meta.deadline {
                             if deadline > now {
                                 let remaining = deadline - now;
-                                format!("Working ({} remaining)", format_duration(remaining))
+                                format!(
+                                    "Working ({} remaining)",
+                                    humantime::format_duration(remaining)
+                                )
                             } else {
                                 "Working (firing...)".to_string()
                             }
@@ -433,60 +420,6 @@ impl ProcessClient {
         Ok(CallToolResult::success(vec![Content::text(
             lines.join("\n"),
         )]))
-    }
-}
-
-fn parse_duration(s: &str) -> Option<std::time::Duration> {
-    let s = s.trim().to_lowercase();
-    let mut total_secs: u64 = 0;
-    let mut num_buf = String::new();
-
-    for c in s.chars() {
-        if c.is_ascii_digit() {
-            num_buf.push(c);
-        } else {
-            let n: u64 = num_buf.parse().ok()?;
-            num_buf.clear();
-            match c {
-                's' => total_secs += n,
-                'm' => total_secs += n * 60,
-                'h' => total_secs += n * 3600,
-                'd' => total_secs += n * 86400,
-                _ => return None,
-            }
-        }
-    }
-    // Handle bare number (assume seconds)
-    if !num_buf.is_empty() {
-        let n: u64 = num_buf.parse().ok()?;
-        total_secs += n;
-    }
-    if total_secs == 0 {
-        return None;
-    }
-    Some(std::time::Duration::from_secs(total_secs))
-}
-
-fn format_duration(d: std::time::Duration) -> String {
-    let secs = d.as_secs();
-    if secs >= 3600 {
-        let h = secs / 3600;
-        let m = (secs % 3600) / 60;
-        if m > 0 {
-            format!("{}h{}m", h, m)
-        } else {
-            format!("{}h", h)
-        }
-    } else if secs >= 60 {
-        let m = secs / 60;
-        let s = secs % 60;
-        if s > 0 {
-            format!("{}m{}s", m, s)
-        } else {
-            format!("{}m", m)
-        }
-    } else {
-        format!("{}s", secs)
     }
 }
 

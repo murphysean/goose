@@ -272,12 +272,13 @@ mod tests {
             working_dir: temp_dir.path().to_path_buf(),
             ..crate::session::Session::default()
         });
+        let (job_registry, _) = crate::jobs::create_job_registry();
         let client = SkillsClient::new(PlatformExtensionContext {
             extension_manager: None,
             session_manager: Arc::new(crate::session::SessionManager::instance()),
             session: Some(session),
             use_login_shell_path: false,
-            job_registry: None,
+            job_registry,
         })
         .unwrap();
 
@@ -300,12 +301,13 @@ mod tests {
 
     #[tokio::test]
     async fn test_load_skill_not_found_returns_error() {
+        let (job_registry, _) = crate::jobs::create_job_registry();
         let client = SkillsClient::new(PlatformExtensionContext {
             extension_manager: None,
             session_manager: Arc::new(crate::session::SessionManager::instance()),
             session: None,
             use_login_shell_path: false,
-            job_registry: None,
+            job_registry,
         })
         .unwrap();
 

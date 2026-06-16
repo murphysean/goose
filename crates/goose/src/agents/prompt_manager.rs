@@ -462,12 +462,13 @@ mod tests {
             )
             .await
             .unwrap();
+        let (job_registry, _) = crate::jobs::create_job_registry();
         let context = PlatformExtensionContext {
             extension_manager: None,
             session_manager,
             session: Some(Arc::new(session)),
             use_login_shell_path: false,
-            job_registry: None,
+            job_registry,
         };
 
         let mut extensions: Vec<ExtensionInfo> = PLATFORM_EXTENSIONS
