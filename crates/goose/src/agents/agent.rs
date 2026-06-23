@@ -50,6 +50,7 @@ use crate::security::egress_inspector::EgressInspector;
 use crate::security::security_inspector::SecurityInspector;
 use crate::session::extension_data::{EnabledExtensionsState, ExtensionState};
 use crate::session::{Session, SessionManager, SessionNameUpdate};
+use crate::tasks::{NotifyPolicy, Task, TaskSource, TaskState};
 use crate::tool_inspection::ToolInspectionManager;
 use crate::tool_monitor::RepetitionInspector;
 use crate::utils::is_token_cancelled;
@@ -250,6 +251,9 @@ pub struct Agent {
     pub(super) retry_manager: RetryManager,
     pub(super) tool_inspection_manager: ToolInspectionManager,
     pub(super) hook_manager: crate::hooks::HookManager,
+    pub task_registry: crate::tasks::SharedTaskRegistry,
+    /// Task event receiver — take this once to listen for actionable events.
+    pub task_event_rx: Mutex<Option<tokio::sync::mpsc::UnboundedReceiver<crate::tasks::TaskEvent>>>,
     #[cfg(test)]
     stop_hook_block_cap_override: Option<u32>,
     container: Mutex<Option<Container>>,
@@ -346,6 +350,7 @@ impl Agent {
         let session_manager = Arc::clone(&config.session_manager);
         let permission_manager = Arc::clone(&config.permission_manager);
         let use_login_shell_path = config.resolve_use_login_shell_path();
+        let (task_registry_handle, task_event_rx) = crate::tasks::create_task_registry();
         Self {
             provider: provider.clone(),
             config,
@@ -356,6 +361,7 @@ impl Agent {
                 client_name,
                 capabilities,
                 use_login_shell_path,
+                task_registry_handle.clone(),
             )),
             final_output_tool: Arc::new(Mutex::new(None)),
             frontend_extensions: Mutex::new(HashMap::new()),
@@ -374,6 +380,8 @@ impl Agent {
                 std::env::current_dir().ok().as_deref(),
                 use_login_shell_path,
             ),
+            task_registry: task_registry_handle,
+            task_event_rx: Mutex::new(Some(task_event_rx)),
             #[cfg(test)]
             stop_hook_block_cap_override: None,
             container: Mutex::new(None),
@@ -381,6 +389,15 @@ impl Agent {
             grind: Mutex::new(None),
             pending_steers: Mutex::new(HashMap::new()),
         }
+    }
+
+    /// Take the task event receiver. Call once to get the channel for listening
+    /// to actionable task events (batch completion, critical failures, etc.).
+    /// Returns None if already taken.
+    pub async fn take_task_event_rx(
+        &self,
+    ) -> Option<tokio::sync::mpsc::UnboundedReceiver<crate::tasks::TaskEvent>> {
+        self.task_event_rx.lock().await.take()
     }
 
     /// Emit a lifecycle hook event with no extra context. Useful for events
@@ -1066,22 +1083,35 @@ impl Agent {
         );
 
         debug!("WAITING_TOOL_START: {}", tool_call.name);
-        let result: ToolCallResult = if self.is_frontend_tool(&tool_call.name).await {
+
+        // Determine whether the tasks extension is loaded before dispatching.
+        // If loaded, create a dedicated cancellation token so the agent can
+        // cancel the tool call later via cancel_task or load(cancel: true).
+        // If not loaded, use the session-level token (no auto-promotion).
+        let tasks_extension_loaded = self
+            .extension_manager
+            .is_extension_enabled(crate::agents::platform_extensions::tasks::EXTENSION_NAME)
+            .await;
+
+        let task_cancel_token = if tasks_extension_loaded {
+            CancellationToken::new()
+        } else {
+            cancellation_token.unwrap_or_default()
+        };
+
+        // Dispatch exactly once with the appropriate cancellation token.
+        let mut result: ToolCallResult = if self.is_frontend_tool(&tool_call.name).await {
             ToolCallResult::from(Err(ErrorData::new(
                 ErrorCode::INTERNAL_ERROR,
                 "Frontend tool execution required".to_string(),
                 None,
             )))
         } else {
-            let result = self
+            let res = self
                 .extension_manager
-                .dispatch_tool_call(
-                    &ctx,
-                    tool_call.clone(),
-                    cancellation_token.unwrap_or_default(),
-                )
+                .dispatch_tool_call(&ctx, tool_call.clone(), task_cancel_token.clone())
                 .await;
-            result.unwrap_or_else(|e| {
+            res.unwrap_or_else(|e| {
                 #[cfg(feature = "telemetry")]
                 crate::posthog::emit_error(
                     "tool_execution_failed",
@@ -1093,6 +1123,119 @@ impl Agent {
                 ToolCallResult::from(Err(error_data))
             })
         };
+
+        if !tasks_extension_loaded {
+            // Tool runs synchronously; the MCP-level timeout will handle cleanup.
+            debug!(
+                "Tasks extension not loaded, skipping auto-promotion for {}",
+                tool_call.name
+            );
+            return (request_id, Ok(result));
+        }
+
+        // Automatic Tool-to-Task Promotion
+        let task_id = format!(
+            "task_{}_{}",
+            tool_call.name,
+            Uuid::new_v4()
+                .as_simple()
+                .to_string()
+                .get(..8)
+                .unwrap_or("00000000")
+        );
+        let description = format!("Tool call: {}", tool_call.name);
+        let registry = self.task_registry.clone();
+
+        // Register initial task state
+        {
+            let mut reg = registry.lock().await;
+            reg.register(Task {
+                id: task_id.clone(),
+                source: TaskSource::McpTool,
+                description: description.clone(),
+                state: TaskState::Working,
+                batch_id: None,
+                notify_policy: NotifyPolicy::OnCompletion,
+                meta: Default::default(),
+                created_at: std::time::Instant::now(),
+                last_activity: std::time::Instant::now(),
+                worked_duration: std::time::Duration::default(),
+                notifications: Vec::new(),
+                status_message: None,
+                result: None,
+                error: None,
+                result_summary: None,
+                input_request: None,
+                ttl_ms: None,
+                poll_interval_ms: None,
+                cancellation_token: Some(task_cancel_token),
+            });
+        }
+
+        let original_fut = result.result;
+        let task_id_for_bg = task_id.clone();
+        let registry_for_bg = registry.clone();
+
+        // Spawn the tool call execution in the background
+        let mut tool_run_task = tokio::spawn(async move {
+            original_fut.await
+        });
+
+        // Attempt snappy completion
+        let limit_ms: u64 = Config::global()
+            .get_param("GOOSE_TOOL_EXECUTION_LIMIT_MS")
+            .unwrap_or(2000);
+        let snappy_timeout = std::time::Duration::from_millis(limit_ms);
+        match tokio::time::timeout(snappy_timeout, &mut tool_run_task).await {
+            Ok(join_res) => {
+                // Finished fast - return result normally.
+                // Clean up the task registry so it never triggers background notifications.
+                let mut reg = registry.lock().await;
+                reg.remove(&task_id);
+                
+                let res = join_res.unwrap_or_else(|e| {
+                    Err(ErrorData::new(ErrorCode::INTERNAL_ERROR, e.to_string(), None))
+                });
+                result.result = Box::new(futures::future::ready(res));
+            }
+            _ => {
+                // Timed out or channel closed - promote to background task.
+                // Spawn a watcher task to update the registry upon completion.
+                tokio::spawn(async move {
+                    if let Ok(res) = tool_run_task.await {
+                        let mut reg = registry_for_bg.lock().await;
+                        match res {
+                            Ok(r) => {
+                                let summary = r
+                                    .content
+                                    .iter()
+                                    .filter_map(|c| c.as_text().map(|t| t.text.clone()))
+                                    .collect::<Vec<_>>()
+                                    .join("\n");
+                                reg.complete(&task_id_for_bg, Some(summary));
+                            }
+                            Err(e) => {
+                                reg.fail(&task_id_for_bg, Some(e.message.to_string()));
+                            }
+                        }
+                    }
+                });
+
+                let instruction = format!(
+                    "The tool '{}' is taking longer than expected and is now running in the background (Task ID: {}). \
+                     You do not need to wait or poll. I will interrupt you with a system message when it completes. \
+                     You may proceed with other tasks in the meantime. \
+                     Use list_tasks to check its status, cancel_task(task_id: \"{}\") to cancel it, \
+                     or get_task(task_id: \"{}\") to retrieve its result when finished.",
+                    tool_call.name, task_id, task_id, task_id
+                );
+
+                // Return a CallToolResult that explains the backgrounding
+                let mcp_res =
+                    CallToolResult::success(vec![rmcp::model::Content::text(instruction)]);
+                result.result = Box::new(futures::future::ready(Ok(mcp_res)));
+            }
+        }
 
         debug!("WAITING_TOOL_END: {}", tool_call.name);
 

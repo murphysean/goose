@@ -46,11 +46,12 @@ pub mod slash_commands;
 pub mod source_roots;
 pub mod sources;
 pub mod subprocess;
-
+pub mod tasks;
 pub mod token_counter;
 pub mod tool_inspection;
 pub mod tool_monitor;
 pub mod tracing;
+pub mod turn_queue;
 pub mod utils;
 #[cfg(windows)]
 pub mod windows_job;

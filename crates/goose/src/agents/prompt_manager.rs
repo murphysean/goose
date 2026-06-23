@@ -6,7 +6,9 @@ use serde::Serialize;
 use serde_json::Value;
 use std::collections::HashMap;
 
-use crate::agents::{extension::ExtensionInfo, moim};
+use crate::agents::extension::ExtensionInfo;
+use crate::agents::moim;
+use crate::agents::platform_extensions::{summon, tasks};
 use crate::hints::load_hints::build_gitignore;
 use crate::hints::{get_context_filenames, load_hint_files, SubdirectoryHintTracker};
 use crate::{
@@ -19,6 +21,7 @@ use std::path::Path;
 const MAX_EXTENSIONS: usize = 5;
 const MAX_TOOLS: usize = 50;
 
+#[derive(Clone)]
 pub struct PromptManager {
     system_prompt_override: Option<String>,
     system_prompt_extras: IndexMap<String, String>,
@@ -115,6 +118,49 @@ impl<'a> SystemPromptBuilder<'a, PromptManager> {
     }
 
     pub fn build(self) -> String {
+        let mut manager = self.manager.clone();
+
+        // Build async tooling instructions based on which extensions are loaded.
+        let has_summon = self
+            .extensions_info
+            .iter()
+            .any(|e| e.name == summon::EXTENSION_NAME);
+        let has_tasks = self
+            .extensions_info
+            .iter()
+            .any(|e| e.name == tasks::EXTENSION_NAME);
+
+        let async_instructions = match (has_summon, has_tasks) {
+            (true, true) => {
+                "If a tool call takes longer than 2 seconds, the system will automatically move it to a background task and return a Task ID. \
+                 DO NOT use `sleep` or poll repeatedly to check on it. The system will interrupt you with a system message when the task completes. \
+                 You should proceed with other tasks or inform the user you are waiting for that specific background result. \
+                 Use list_tasks to see all running tasks, cancel_task(task_id: \"...\") to cancel one, \
+                 or get_task(task_id: \"...\") or load(source: \"task_id\") to retrieve and reap a completed task's result.".to_string()
+            }
+            (true, false) => {
+                // No auto-promotion without tasks extension. Summon's load tool
+                // is available for subagent results, but tool calls run synchronously.
+                String::new()
+            }
+            (false, true) => {
+                "If a tool call takes longer than 2 seconds, the system will automatically move it to a background task and return a Task ID. \
+                 DO NOT use `sleep` or poll repeatedly to check on it. The system will interrupt you with a system message when the task completes. \
+                 You should proceed with other tasks or inform the user you are waiting for that specific background result. \
+                 Use list_tasks to see all running tasks, cancel_task(task_id: \"...\") to cancel one, \
+                 or get_task(task_id: \"...\") to retrieve and reap a completed task's result.".to_string()
+            }
+            (false, false) => {
+                // No task management tools available — auto-promotion is disabled.
+                // Tools run synchronously; the MCP-level timeout handles cleanup.
+                String::new()
+            }
+        };
+
+        if !async_instructions.is_empty() {
+            manager.add_system_prompt_extra("async_tooling".to_string(), async_instructions);
+        }
+
         let mut extensions_info = self.extensions_info;
 
         // Add frontend instructions to extensions_info to simplify json rendering
@@ -465,11 +511,13 @@ mod tests {
             )
             .await
             .unwrap();
+        let (task_registry, _) = crate::tasks::create_task_registry();
         let context = PlatformExtensionContext {
             extension_manager: None,
             session_manager,
             session: Some(Arc::new(session)),
             use_login_shell_path: false,
+            task_registry,
         };
 
         let mut extensions: Vec<ExtensionInfo> = PLATFORM_EXTENSIONS

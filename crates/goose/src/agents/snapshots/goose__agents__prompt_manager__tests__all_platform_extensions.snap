@@ -1,6 +1,5 @@
 ---
 source: crates/goose/src/agents/prompt_manager.rs
-assertion_line: 458
 expression: system_prompt
 ---
 You are a general-purpose AI agent called goose, created by AAIF (Agentic AI Foundation).
@@ -131,6 +130,10 @@ You have these skills at your disposal, when it is clear they can help you solve
 ## summon
 
 
+## tasks
+
+### Instructions
+Manage background processes and scheduled reminders. Start processes, read output, write stdin, stop them. Schedule timed reminders that interrupt you with a message after a delay. List all active tasks.
 ## todo
 
 ### Instructions

@@ -70,6 +70,7 @@ pub struct BackgroundTask {
     pub started_at: Instant,
     pub turns: Arc<AtomicU32>,
     pub last_activity: Arc<AtomicU64>,
+    pub last_message: Arc<std::sync::Mutex<String>>,
     pub handle: JoinHandle<Result<String>>,
     pub cancellation_token: CancellationToken,
     pub notification_buffer: Arc<Mutex<Vec<ServerNotification>>>,
@@ -444,6 +445,9 @@ fn completed_task_ttl() -> Duration {
 }
 
 fn is_session_id(s: &str) -> bool {
+    if s.starts_with("task_") {
+        return true;
+    }
     let parts: Vec<&str> = s.split('_').collect();
     parts.len() == 2 && parts[0].len() == 8 && parts[0].chars().all(|c| c.is_ascii_digit())
 }
@@ -521,7 +525,7 @@ impl SummonClient {
                 "peek": {
                     "type": "boolean",
                     "default": false,
-                    "description": "For running background tasks: check progress without blocking. Returns turn count, idle time, and recent tool activity."
+                    "description": "Get a quick status snapshot of a background task without blocking or consuming it."
                 }
             }
         });
@@ -533,12 +537,15 @@ impl SummonClient {
              Call with a source name to load its content into your context.\n\
              For background tasks: load(source: \"task_id\") waits for the task and returns the result.\n\
              To cancel a running task: load(source: \"task_id\", cancel: true) stops and returns output.\n\
-             To check progress: load(source: \"task_id\", peek: true) returns status without blocking.\n\n\
+             To check status without blocking: load(source: \"task_id\", peek: true) returns a quick snapshot.\n\n\
+             IMPORTANT: Do NOT poll background tasks with peek or load. The system will notify you\n\
+             automatically when a task completes via a \"System: Background task ...\" message.\n\
+             Only use load(source: \"task_id\") in response to that notification to collect the result.\n\n\
              Examples:\n\
              - load() → Lists available sources\n\
              - load(source: \"deploy\") → Loads the deploy recipe\n\
              - load(source: \"20260219_1\") → Waits for background task, then returns result\n\
-             - load(source: \"20260219_1\", peek: true) → Check task progress without waiting"
+             - load(source: \"20260219_1\", peek: true) → Quick status check (non-blocking)"
                 .to_string(),
             schema.as_object().unwrap().clone(),
         )
@@ -612,7 +619,17 @@ impl SummonClient {
              - Parallel: async: true, then load(taskId) to wait and get results. Single: sync.\n\n\
              Research (read-only): parallelize freely - delegates explore and report back.\n\
              Work (writes): partition files strictly - no two delegates touch the same file.\n\n\
-             Decompose → async delegates → load(taskId) for each → synthesize."
+             Async workflow (DO NOT poll):\n\
+             1. Launch with async: true — the tool returns a task ID immediately\n\
+             2. Continue working with the user — the system will notify you when done\n\
+             3. When you receive \"System: Background task X has completed\" — use load(source: \"X\") to collect\n\n\
+             Best practices:\n\
+             - Use async: true for builds, tests, deploys, and any task expected to take >30 seconds\n\
+             - After delegating async, continue working with the user — do NOT poll\n\
+             - The system sends a notification when each task completes — wait for it\n\
+             - Only use load(source: \"taskId\") in response to a completion notification\n\
+             - Use load(source: \"taskId\", peek: true) only if you need a quick status check without blocking\n\n\
+             Decompose → async delegates → wait for notifications → load to collect → synthesize."
                 .to_string(),
             schema.as_object().unwrap().clone(),
         )
@@ -840,6 +857,12 @@ impl SummonClient {
         let name = source_name.unwrap();
 
         if is_session_id(name) {
+            if peek {
+                return self
+                    .handle_peek_task(name)
+                    .await
+                    .map(CallToolResult::success);
+            }
             let task_result = self.handle_load_task_result(name, cancel, peek).await?;
             let mut meta = Meta::new();
             meta.0.insert(
@@ -876,6 +899,78 @@ impl SummonClient {
         cancel: bool,
         peek: bool,
     ) -> Result<TaskLoadResult, String> {
+        // First check the TaskRegistry for auto-promoted tool tasks
+        let mut registry = self.context.task_registry.lock().await;
+        if let Some(task) = registry.get(task_id) {
+            if task.source == crate::tasks::TaskSource::McpTool {
+                if task.state == crate::tasks::TaskState::Working {
+                    if cancel {
+                        let description = task.description.clone();
+                        let _ = task;
+                        // Cancel via the task registry, which fires the
+                        // cancellation token and sends MCP notifications/cancelled.
+                        registry.cancel(task_id);
+                        drop(registry);
+                        // Wait briefly for the MCP operation to unwind.
+                        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+                        return Ok(TaskLoadResult {
+                            content: vec![Content::text(format!(
+                                "# Background Tool Result: {}\n\n\
+                                 **Tool:** {}\n\
+                                 **Status:** ⊘ Cancelled\n\n\
+                                 The task was cancelled by the agent.",
+                                task_id, description
+                            ))],
+                            status: "cancelled",
+                            turns: None,
+                            duration_secs: None,
+                        });
+                    }
+                    return Err(format!(
+                        "Background tool task '{}' is still running. I will notify you when it finishes.",
+                        task_id
+                    ));
+                }
+
+                let status_key = match task.state {
+                    crate::tasks::TaskState::Completed => "completed",
+                    crate::tasks::TaskState::Cancelled => "cancelled",
+                    _ => "failed",
+                };
+
+                let status_display = match status_key {
+                    "completed" => "✓ Completed",
+                    "cancelled" => "⊘ Cancelled",
+                    _ => "✗ Failed",
+                };
+
+                let output = task
+                    .result_summary
+                    .clone()
+                    .unwrap_or_else(|| "No output available".to_string());
+                let duration = task.worked_duration;
+
+                return Ok(TaskLoadResult {
+                    content: vec![Content::text(format!(
+                        "# Background Tool Result: {}\n\n\
+                         **Tool:** {}\n\
+                         **Status:** {}\n\
+                         **Duration:** {}\n\n\
+                         ## Output\n\n{}",
+                        task_id,
+                        task.description,
+                        status_display,
+                        round_duration(duration),
+                        output
+                    ))],
+                    status: status_key,
+                    turns: None,
+                    duration_secs: Some(duration.as_secs()),
+                });
+            }
+        }
+        drop(registry);
+
         let mut completed = self.completed_tasks.lock().await;
 
         let completed_entry = if peek {
@@ -1076,6 +1171,74 @@ impl SummonClient {
                     ));
                 }
             }
+        }
+
+        Err(format!("Task '{}' not found.", task_id))
+    }
+
+    async fn handle_peek_task(&self, task_id: &str) -> Result<Vec<Content>, String> {
+        // Check completed tasks first
+        let completed = self.completed_tasks.lock().await;
+        if let Some(task) = completed.get(task_id) {
+            let status = if task.result.is_ok() {
+                "✓ Completed"
+            } else {
+                "✗ Failed"
+            };
+            return Ok(vec![Content::text(format!(
+                "# Task Status: {}\n\n\
+                 **Task:** {}\n\
+                 **Status:** {}\n\
+                 **Duration:** {}\n\
+                 **Turns:** {}",
+                task_id,
+                task.description,
+                status,
+                round_duration(task.duration),
+                task.turns_taken,
+            ))]);
+        }
+        drop(completed);
+
+        // Check running tasks (read-only — no removal)
+        let running = self.background_tasks.lock().await;
+        if let Some(task) = running.get(task_id) {
+            let elapsed = task.started_at.elapsed();
+            let turns = task.turns.load(Ordering::Relaxed);
+            let now = current_epoch_millis();
+            let idle_ms = now.saturating_sub(task.last_activity.load(Ordering::Relaxed));
+            let last_msg = task.last_message.lock().unwrap().clone();
+            let notif_count = task.notification_buffer.lock().await.len();
+
+            let status = if task.handle.is_finished() {
+                "Completed (pending collection)"
+            } else {
+                "Running"
+            };
+
+            let mut output = format!(
+                "# Task Status: {}\n\n\
+                 **Task:** {}\n\
+                 **Status:** {}\n\
+                 **Duration:** {}\n\
+                 **Turns:** {}\n\
+                 **Idle:** {}",
+                task_id,
+                task.description,
+                status,
+                round_duration(elapsed),
+                turns,
+                round_duration(Duration::from_millis(idle_ms)),
+            );
+
+            if !last_msg.is_empty() {
+                output.push_str(&format!("\n**Last message:** {}", last_msg));
+            }
+            if notif_count > 0 {
+                output.push_str(&format!("\n**Buffered notifications:** {}", notif_count));
+            }
+
+            return Ok(vec![Content::text(output)]);
         }
 
         Err(format!("Task '{}' not found.", task_id))
@@ -1718,7 +1881,7 @@ impl SummonClient {
             completed.insert(
                 id.clone(),
                 CompletedTask {
-                    id,
+                    id: id.clone(),
                     description: task.description,
                     result,
                     turns_taken,
@@ -1726,6 +1889,14 @@ impl SummonClient {
                     completed_at: Instant::now(),
                 },
             );
+
+            // Update task registry
+            let is_success = completed.get(&id).is_some_and(|t| t.result.is_ok());
+            if is_success {
+                self.context.task_registry.lock().await.complete(&id, None);
+            } else {
+                self.context.task_registry.lock().await.fail(&id, None);
+            }
         }
 
         let ttl = completed_task_ttl();
@@ -1803,13 +1974,26 @@ impl SummonClient {
 
         let turns = Arc::new(AtomicU32::new(0));
         let last_activity = Arc::new(AtomicU64::new(current_epoch_millis()));
+        let last_message = Arc::new(std::sync::Mutex::new(String::new()));
 
         let turns_clone = Arc::clone(&turns);
         let last_activity_clone = Arc::clone(&last_activity);
+        let last_message_clone = Arc::clone(&last_message);
 
-        let on_message: OnMessageCallback = Arc::new(move |_msg| {
+        let on_message: OnMessageCallback = Arc::new(move |msg| {
             turns_clone.fetch_add(1, Ordering::Relaxed);
             last_activity_clone.store(current_epoch_millis(), Ordering::Relaxed);
+            if msg.role == rmcp::model::Role::Assistant {
+                let text = msg.as_concat_text();
+                if !text.is_empty() {
+                    let snippet = if text.len() > 200 {
+                        format!("{}...", &text.chars().take(200).collect::<String>())
+                    } else {
+                        text
+                    };
+                    *last_message_clone.lock().unwrap() = snippet;
+                }
+            }
         });
 
         let task_token = CancellationToken::new();
@@ -1824,8 +2008,10 @@ impl SummonClient {
             Arc::clone(&notification_buffer),
         );
 
+        let (done_tx, done_rx) = tokio::sync::oneshot::channel::<()>();
+
         let handle = tokio::spawn(async move {
-            run_subagent_task(SubagentRunParams {
+            let result = run_subagent_task(SubagentRunParams {
                 config: agent_config,
                 recipe,
                 task_config,
@@ -1835,7 +2021,9 @@ impl SummonClient {
                 on_message: Some(on_message),
                 notification_tx: Some(notif_tx),
             })
-            .await
+            .await;
+            let _ = done_tx.send(());
+            result
         });
 
         let task = BackgroundTask {
@@ -1844,6 +2032,7 @@ impl SummonClient {
             started_at: Instant::now(),
             turns,
             last_activity,
+            last_message,
             handle,
             cancellation_token: task_token,
             notification_buffer,
@@ -1853,6 +2042,43 @@ impl SummonClient {
             .lock()
             .await
             .insert(task_id.clone(), task);
+
+        // Register in the unified task registry
+        let task = crate::tasks::Task {
+            id: task_id.clone(),
+            source: crate::tasks::TaskSource::Subagent,
+            description: description.clone(),
+            state: crate::tasks::TaskState::Working,
+            batch_id: None,
+            notify_policy: crate::tasks::NotifyPolicy::OnCompletion,
+            meta: crate::tasks::TaskMeta::default(),
+            created_at: std::time::Instant::now(),
+            last_activity: std::time::Instant::now(),
+            worked_duration: std::time::Duration::default(),
+            notifications: Vec::new(),
+            status_message: None,
+            result: None,
+            error: None,
+            result_summary: None,
+            input_request: None,
+            ttl_ms: None,
+            poll_interval_ms: None,
+            cancellation_token: None,
+        };
+        self.context.task_registry.lock().await.register(task);
+
+        // Spawn watcher that awaits task completion via oneshot (no polling).
+        let registry_clone = Arc::clone(&self.context.task_registry);
+        let watcher_id = task_id.clone();
+        tokio::spawn(async move {
+            let _ = done_rx.await;
+            let mut reg = registry_clone.lock().await;
+            if let Some(task) = reg.get(&watcher_id) {
+                if !task.state.is_terminal() {
+                    reg.complete(&watcher_id, None);
+                }
+            }
+        });
 
         let content = vec![Content::text(format!(
             "Task {} started in background: \"{}\"\n\
@@ -2000,7 +2226,7 @@ impl McpClientTrait for SummonClient {
 
         if !running.is_empty() {
             lines.push(
-                "\n→ Use load(source: \"<id>\") to wait for a task, or load(source: \"<id>\", cancel: true) to stop it"
+                "\n→ The system will notify you when tasks complete — wait for the notification, then load(source: \"<id>\") to collect | cancel: load(source: \"<id>\", cancel: true)"
                     .to_string(),
             );
         }
@@ -2047,11 +2273,13 @@ mod tests {
     use tempfile::TempDir;
 
     fn create_test_context() -> PlatformExtensionContext {
+        let (task_registry, _) = crate::tasks::create_task_registry();
         PlatformExtensionContext {
             extension_manager: None,
             session_manager: Arc::new(crate::session::SessionManager::instance()),
             session: None,
             use_login_shell_path: false,
+            task_registry,
         }
     }
 
@@ -2645,7 +2873,7 @@ You review code."#;
         assert!(is_session_id("20260204_1"));
         assert!(is_session_id("20260204_42"));
         assert!(is_session_id("20260204_999"));
-        assert!(!is_session_id("task_12345_0001"));
+        assert!(is_session_id("task_12345_0001")); // Task IDs are routed like session IDs
         assert!(!is_session_id("my-recipe"));
         assert!(!is_session_id("2026020_1"));
         assert!(!is_session_id("20260204"));
@@ -2687,6 +2915,7 @@ You review code."#;
                     started_at: Instant::now(),
                     turns: Arc::new(AtomicU32::new(2)),
                     last_activity: Arc::new(AtomicU64::new(current_epoch_millis())),
+                    last_message: Arc::new(std::sync::Mutex::new(String::new())),
                     handle: tokio::spawn(async {
                         tokio::time::sleep(Duration::from_millis(50)).await;
                         Ok("done".to_string())
@@ -2815,6 +3044,7 @@ You review code."#;
                     started_at: Instant::now(),
                     turns: Arc::new(AtomicU32::new(3)),
                     last_activity: Arc::new(AtomicU64::new(current_epoch_millis())),
+                    last_message: Arc::new(std::sync::Mutex::new(String::new())),
                     handle: tokio::spawn(async {
                         tokio::time::sleep(Duration::from_secs(1000)).await;
                         Ok("should not see this".to_string())
@@ -2857,6 +3087,7 @@ You review code."#;
                     started_at: Instant::now(),
                     turns: Arc::new(AtomicU32::new(7)),
                     last_activity: Arc::new(AtomicU64::new(current_epoch_millis())),
+                    last_message: Arc::new(std::sync::Mutex::new(String::new())),
                     handle: tokio::spawn(async {
                         tokio::time::sleep(Duration::from_secs(1000)).await;
                         Ok("eventual result".to_string())

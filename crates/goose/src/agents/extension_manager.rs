@@ -35,7 +35,7 @@ use super::types::SharedProvider;
 use crate::agents::extension::{Envs, ProcessExit};
 use crate::agents::extension_malware_check;
 use crate::agents::mcp_client::{
-    GooseMcpClientCapabilities, GooseMcpHostInfo, McpClient, McpClientTrait,
+    ConnectionOptions, GooseMcpClientCapabilities, GooseMcpHostInfo, McpClient, McpClientTrait,
 };
 use crate::builtin_extension::get_builtin_extension;
 use crate::config::extensions::name_to_key;
@@ -144,6 +144,10 @@ pub struct ExtensionManager {
     tools_cache_version: AtomicU64,
     client_name: String,
     capabilities: ExtensionManagerCapabilities,
+    /// Broadcast channel for all MCP notifications (extension_name, notification).
+    /// Consumers (CLI, Task Registry) subscribe to receive real-time notifications.
+    notification_broadcast:
+        tokio::sync::broadcast::Sender<(String, rmcp::model::ServerNotification)>,
 }
 
 /// A flattened representation of a resource used by the agent to prepare inference
@@ -325,6 +329,7 @@ struct ResolvedTool {
     resource_uri: Option<String>,
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn child_process_client(
     mut command: Command,
     timeout: &Option<u64>,
@@ -333,6 +338,7 @@ async fn child_process_client(
     docker_container: Option<String>,
     client_name: String,
     capabilities: GooseMcpClientCapabilities,
+    opts: ConnectionOptions,
 ) -> ExtensionResult<McpClient> {
     configure_subprocess(&mut command);
 
@@ -372,7 +378,7 @@ async fn child_process_client(
         Ok::<String, std::io::Error>(String::from_utf8_lossy(&all_stderr).into())
     });
 
-    let client_result = McpClient::connect_with_container(
+    let client_result = McpClient::connect_with_options(
         transport,
         Duration::from_secs(resolve_timeout(*timeout)),
         provider,
@@ -380,6 +386,7 @@ async fn child_process_client(
         client_name,
         capabilities,
         working_dir.clone(),
+        opts,
     )
     .await;
 
@@ -550,6 +557,9 @@ async fn connect_with_auth(
     client_name: String,
     capabilities: GooseMcpClientCapabilities,
     roots_dir: &std::path::Path,
+    notification_broadcast: Option<
+        tokio::sync::broadcast::Sender<(String, rmcp::model::ServerNotification)>,
+    >,
 ) -> ExtensionResult<Box<dyn McpClientTrait>> {
     let mut auth_headers = HeaderMap::new();
     auth_headers.insert(reqwest::header::USER_AGENT, GOOSE_USER_AGENT);
@@ -577,13 +587,19 @@ async fn connect_with_auth(
         StreamableHttpClientTransportConfig::with_uri(uri),
     );
     Ok(Box::new(
-        McpClient::connect(
+        McpClient::connect_with_options(
             transport,
             timeout,
             provider,
+            None,
             client_name,
             capabilities,
             roots_dir.to_path_buf(),
+            ConnectionOptions {
+                notification_broadcast,
+                extension_name: None,
+                docker_container: None,
+            },
         )
         .await?,
     ))
@@ -601,6 +617,9 @@ async fn create_streamable_http_client(
     client_name: String,
     capabilities: GooseMcpClientCapabilities,
     roots_dir: &std::path::Path,
+    notification_broadcast: Option<
+        tokio::sync::broadcast::Sender<(String, rmcp::model::ServerNotification)>,
+    >,
 ) -> ExtensionResult<Box<dyn McpClientTrait>> {
     #[cfg(unix)]
     if let Some(socket_path) = socket {
@@ -614,6 +633,7 @@ async fn create_streamable_http_client(
             client_name,
             capabilities,
             roots_dir,
+            notification_broadcast,
         )
         .await;
     }
@@ -669,6 +689,7 @@ async fn create_streamable_http_client(
                     client_name.clone(),
                     capabilities.clone(),
                     roots_dir,
+                    notification_broadcast.clone(),
                 )
                 .await;
 
@@ -700,13 +721,20 @@ async fn create_streamable_http_client(
         }
     }
 
-    let client_res = McpClient::connect(
+    let opts = ConnectionOptions {
+        notification_broadcast: notification_broadcast.clone(),
+        extension_name: Some(name.to_string()),
+        docker_container: None,
+    };
+    let client_res = McpClient::connect_with_options(
         transport,
         timeout_duration,
         provider.clone(),
+        None,
         client_name.clone(),
         capabilities.clone(),
         roots_dir.to_path_buf(),
+        opts,
     )
     .await;
 
@@ -722,6 +750,7 @@ async fn create_streamable_http_client(
                     client_name,
                     capabilities,
                     roots_dir,
+                    notification_broadcast,
                 )
                 .await
             }
@@ -744,6 +773,9 @@ async fn create_unix_socket_http_client(
     client_name: String,
     capabilities: GooseMcpClientCapabilities,
     roots_dir: &std::path::Path,
+    notification_broadcast: Option<
+        tokio::sync::broadcast::Sender<(String, rmcp::model::ServerNotification)>,
+    >,
 ) -> ExtensionResult<Box<dyn McpClientTrait>> {
     use rmcp::transport::UnixSocketHttpClient;
 
@@ -774,13 +806,19 @@ async fn create_unix_socket_http_client(
 
     let timeout_duration = Duration::from_secs(resolve_timeout(timeout));
 
-    let client_res = McpClient::connect(
+    let client_res = McpClient::connect_with_options(
         transport,
         timeout_duration,
         provider.clone(),
+        None,
         client_name.clone(),
         capabilities.clone(),
         roots_dir.to_path_buf(),
+        ConnectionOptions {
+            notification_broadcast,
+            extension_name: Some(name.to_string()),
+            docker_container: None,
+        },
     )
     .await;
 
@@ -808,7 +846,9 @@ impl ExtensionManager {
         client_name: String,
         capabilities: ExtensionManagerCapabilities,
         use_login_shell_path: bool,
+        task_registry: crate::tasks::SharedTaskRegistry,
     ) -> Self {
+        let (notification_broadcast, _) = tokio::sync::broadcast::channel(256);
         Self {
             extensions: Mutex::new(HashMap::new()),
             context: PlatformExtensionContext {
@@ -816,17 +856,20 @@ impl ExtensionManager {
                 session_manager,
                 session: None,
                 use_login_shell_path,
+                task_registry,
             },
             provider,
             tools_cache: Mutex::new(None),
             tools_cache_version: AtomicU64::new(0),
             client_name,
             capabilities,
+            notification_broadcast,
         }
     }
 
     pub fn new_without_provider(data_dir: std::path::PathBuf) -> Self {
         let session_manager = Arc::new(crate::session::SessionManager::new(data_dir));
+        let (task_registry, _) = crate::tasks::create_task_registry();
         Self::new(
             Arc::new(Mutex::new(None)),
             session_manager,
@@ -836,11 +879,27 @@ impl ExtensionManager {
                 host_info: None,
             },
             false,
+            task_registry,
         )
     }
 
     pub fn get_context(&self) -> &PlatformExtensionContext {
         &self.context
+    }
+
+    /// Subscribe to the notification broadcast channel.
+    /// Returns a receiver that gets all MCP notifications from all extensions.
+    pub fn subscribe_notifications(
+        &self,
+    ) -> tokio::sync::broadcast::Receiver<(String, rmcp::model::ServerNotification)> {
+        self.notification_broadcast.subscribe()
+    }
+
+    /// Get a clone of the notification broadcast sender (for passing to MCP clients).
+    pub fn notification_sender(
+        &self,
+    ) -> tokio::sync::broadcast::Sender<(String, rmcp::model::ServerNotification)> {
+        self.notification_broadcast.clone()
     }
 
     pub fn get_provider(&self) -> &SharedProvider {
@@ -925,6 +984,7 @@ impl ExtensionManager {
                     self.client_name.clone(),
                     self.mcp_client_capabilities(),
                     &effective_working_dir,
+                    Some(self.notification_broadcast.clone()),
                 )
                 .await?
             }
@@ -982,6 +1042,11 @@ impl ExtensionManager {
                             Some(container_id.to_string()),
                             self.client_name.clone(),
                             self.mcp_client_capabilities(),
+                            ConnectionOptions {
+                                notification_broadcast: Some(self.notification_broadcast.clone()),
+                                extension_name: Some(sanitized_name.clone()),
+                                docker_container: Some(container_id.to_string()),
+                            },
                         )
                         .await?;
                         Box::new(client)
@@ -991,13 +1056,21 @@ impl ExtensionManager {
                         extension_fn(server_read, server_write);
 
                         Box::new(
-                            McpClient::connect(
+                            McpClient::connect_with_options(
                                 (client_read, client_write),
                                 Duration::from_secs(timeout_secs),
                                 self.provider.clone(),
+                                None,
                                 self.client_name.clone(),
                                 self.mcp_client_capabilities(),
                                 effective_working_dir.clone(),
+                                ConnectionOptions {
+                                    notification_broadcast: Some(
+                                        self.notification_broadcast.clone(),
+                                    ),
+                                    extension_name: Some(sanitized_name.clone()),
+                                    docker_container: None,
+                                },
                             )
                             .await?,
                         )
@@ -1059,6 +1132,11 @@ impl ExtensionManager {
                     container.map(|c| c.id().to_string()),
                     self.client_name.clone(),
                     self.mcp_client_capabilities(),
+                    ConnectionOptions {
+                        notification_broadcast: Some(self.notification_broadcast.clone()),
+                        extension_name: Some(sanitized_name.clone()),
+                        docker_container: container.map(|c| c.id().to_string()),
+                    },
                 )
                 .await?;
                 Box::new(client)
@@ -1091,6 +1169,11 @@ impl ExtensionManager {
                     container.map(|c| c.id().to_string()),
                     self.client_name.clone(),
                     self.mcp_client_capabilities(),
+                    ConnectionOptions {
+                        notification_broadcast: Some(self.notification_broadcast.clone()),
+                        extension_name: Some(sanitized_name.clone()),
+                        docker_container: container.map(|c| c.id().to_string()),
+                    },
                 )
                 .await?;
 
@@ -1987,6 +2070,7 @@ impl ExtensionManager {
                 parts.push(moim_content);
             }
         }
+
         parts
     }
 }
@@ -2780,6 +2864,7 @@ mod tests {
             "goose-test".to_string(),
             capabilities,
             temp_dir.path(),
+            None,
         )
         .await;
 
@@ -2815,6 +2900,7 @@ mod tests {
             "goose-test".to_string(),
             capabilities,
             temp_dir.path(),
+            None,
         )
         .await;
 
@@ -2861,6 +2947,7 @@ mod tests {
             "goose-test".to_string(),
             capabilities,
             temp_dir.path(),
+            None,
         )
         .await;
 
@@ -2942,6 +3029,7 @@ mod tests {
             "goose-test".to_string(),
             capabilities,
             temp_dir.path(),
+            None,
         )
         .await;
 

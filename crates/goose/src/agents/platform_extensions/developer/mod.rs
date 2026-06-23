@@ -262,11 +262,13 @@ mod tests {
     }
 
     fn test_context(data_dir: std::path::PathBuf) -> PlatformExtensionContext {
+        let (task_registry, _) = crate::tasks::create_task_registry();
         PlatformExtensionContext {
             extension_manager: None,
             session_manager: Arc::new(SessionManager::new(data_dir)),
             session: None,
             use_login_shell_path: false,
+            task_registry,
         }
     }
 

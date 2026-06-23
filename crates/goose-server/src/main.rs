@@ -6,6 +6,7 @@ mod openapi;
 mod routes;
 mod session_event_bus;
 mod state;
+mod task_watcher;
 mod tunnel;
 
 use std::path::PathBuf;

@@ -1,0 +1,796 @@
+use crate::agents::extension::PlatformExtensionContext;
+use crate::agents::mcp_client::{Error, McpClientTrait};
+use crate::agents::tool_execution::ToolCallContext;
+use crate::tasks::{NotifyPolicy, Task, TaskSource, TaskState};
+use anyhow::Result;
+use async_trait::async_trait;
+use rmcp::model::{
+    CallToolResult, Content, Implementation, InitializeResult, JsonObject, ListToolsResult,
+    ServerCapabilities, Tool,
+};
+use std::collections::HashMap;
+use std::process::Stdio;
+use std::sync::Arc;
+use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+use tokio::process::{Child, Command};
+use tokio::sync::Mutex;
+use tokio_util::sync::CancellationToken;
+
+pub static EXTENSION_NAME: &str = "tasks";
+
+#[allow(dead_code)]
+struct ManagedProcess {
+    child: Child,
+    stdin: Option<tokio::process::ChildStdin>,
+    output_lines: Arc<Mutex<Vec<String>>>,
+    #[allow(dead_code)]
+    description: String,
+}
+
+pub struct TasksClient {
+    info: InitializeResult,
+    context: PlatformExtensionContext,
+    processes: Arc<Mutex<HashMap<String, ManagedProcess>>>,
+    next_id: Arc<Mutex<u32>>,
+}
+
+impl TasksClient {
+    pub fn new(context: PlatformExtensionContext) -> Result<Self> {
+        let info = InitializeResult::new(ServerCapabilities::builder().enable_tools().build())
+            .with_server_info(
+                Implementation::new(EXTENSION_NAME, "1.0.0").with_title("Process Manager"),
+            )
+            .with_instructions(
+                "Manage background processes and scheduled reminders. Start processes, read output, write stdin, stop them. Schedule timed reminders that interrupt you with a message after a delay. List all active tasks.",
+            );
+
+        Ok(Self {
+            info,
+            context,
+            processes: Arc::new(Mutex::new(HashMap::new())),
+            next_id: Arc::new(Mutex::new(1)),
+        })
+    }
+
+    async fn handle_start(&self, arguments: Option<JsonObject>) -> Result<CallToolResult, String> {
+        let args = arguments.ok_or("Missing arguments")?;
+        let command = args
+            .get("command")
+            .and_then(|v| v.as_str())
+            .ok_or("Missing 'command' argument")?;
+        let wait_for = args
+            .get("wait_for")
+            .and_then(|v| v.as_str())
+            .map(|s| s.to_string());
+
+        let mut id_lock = self.next_id.lock().await;
+        let id = format!("proc_{}", *id_lock);
+        *id_lock += 1;
+        drop(id_lock);
+
+        let mut child = Command::new("sh")
+            .arg("-c")
+            .arg(command)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .map_err(|e| format!("Failed to start process: {}", e))?;
+
+        let stdin = child.stdin.take();
+        let stdout = child.stdout.take();
+        let stderr = child.stderr.take();
+
+        let output_lines: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
+
+        // Channel to signal when stdout closes (process exited)
+        let (stdout_done_tx, stdout_done_rx) = tokio::sync::oneshot::channel::<()>();
+
+        // Spawn stdout reader with optional pattern matching
+        if let Some(stdout) = stdout {
+            let lines = Arc::clone(&output_lines);
+            let pattern = wait_for.clone();
+            let registry = self.context.task_registry.clone();
+            let task_id = id.clone();
+            tokio::spawn(async move {
+                let reader = BufReader::new(stdout);
+                let mut lines_stream = reader.lines();
+                let mut pattern_fired = false;
+                while let Ok(Some(line)) = lines_stream.next_line().await {
+                    lines.lock().await.push(format!("[stdout] {}", line));
+                    if !pattern_fired {
+                        if let Some(ref pat) = pattern {
+                            if line.contains(pat.as_str()) {
+                                pattern_fired = true;
+                                registry.lock().await.pattern_matched(
+                                    &task_id,
+                                    pat.clone(),
+                                    line.clone(),
+                                );
+                            }
+                        }
+                    }
+                }
+                // Stdout closed — process exited
+                let _ = stdout_done_tx.send(());
+            });
+        }
+        if let Some(stderr) = stderr {
+            let lines = Arc::clone(&output_lines);
+            tokio::spawn(async move {
+                let reader = BufReader::new(stderr);
+                let mut lines_stream = reader.lines();
+                while let Ok(Some(line)) = lines_stream.next_line().await {
+                    lines.lock().await.push(format!("[stderr] {}", line));
+                }
+            });
+        }
+
+        // Spawn completion watcher — waits for stdout to close then marks task complete/failed
+        let registry = Arc::clone(&self.context.task_registry);
+        let task_id = id.clone();
+        let processes = Arc::clone(&self.processes);
+        tokio::spawn(async move {
+            let _ = stdout_done_rx.await;
+            // Small delay to let stderr drain and child to exit
+            tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+            // Try to get exit code from the child
+            let code = {
+                let mut procs = processes.lock().await;
+                if let Some(proc) = procs.get_mut(&task_id) {
+                    proc.child.try_wait().ok().flatten().and_then(|s| s.code())
+                } else {
+                    None
+                }
+            };
+            let mut reg = registry.lock().await;
+            if let Some(task) = reg.get(&task_id) {
+                if !task.state.is_terminal() {
+                    if code.unwrap_or(0) == 0 {
+                        reg.complete(&task_id, None);
+                    } else {
+                        reg.fail(&task_id, Some(format!("exit code: {}", code.unwrap_or(-1))));
+                    }
+                }
+            }
+        });
+
+        let description = if command.len() > 60 {
+            format!("{}...", &command.chars().take(60).collect::<String>())
+        } else {
+            command.to_string()
+        };
+
+        // Register in task registry BEFORE watcher can fire
+        let registry = Arc::clone(&self.context.task_registry);
+        let task = Task {
+            id: id.clone(),
+            source: TaskSource::Process,
+            description: description.clone(),
+            state: TaskState::Working,
+            batch_id: None,
+            notify_policy: NotifyPolicy::OnCompletion,
+            meta: crate::tasks::TaskMeta::default(),
+            created_at: std::time::Instant::now(),
+            last_activity: std::time::Instant::now(),
+            worked_duration: std::time::Duration::default(),
+            notifications: Vec::new(),
+            status_message: None,
+            result: None,
+            error: None,
+            result_summary: None,
+            input_request: None,
+            ttl_ms: None,
+            poll_interval_ms: None,
+            cancellation_token: None,
+        };
+        registry.lock().await.register(task);
+
+        let managed = ManagedProcess {
+            child,
+            stdin,
+            output_lines: output_lines.clone(),
+            description: description.clone(),
+        };
+
+        // Store the output_lines reference for read_output
+        // We'll read from the Arc in read_output
+        self.processes.lock().await.insert(id.clone(), managed);
+
+        Ok(CallToolResult::success(vec![Content::text(format!(
+            "Process started with handle: {}\nCommand: {}\n\nUse read_output(\"{}\") to check output, write_stdin(\"{}\", ...) to send input, stop_process(\"{}\") to terminate.",
+            id, command, id, id, id
+        ))]))
+    }
+
+    async fn handle_read_output(
+        &self,
+        arguments: Option<JsonObject>,
+    ) -> Result<CallToolResult, String> {
+        let args = arguments.ok_or("Missing arguments")?;
+        let process_id = args
+            .get("process_id")
+            .and_then(|v| v.as_str())
+            .ok_or("Missing 'process_id' argument")?;
+
+        let processes = self.processes.lock().await;
+        let proc = processes
+            .get(process_id)
+            .ok_or_else(|| format!("Process '{}' not found", process_id))?;
+
+        let is_running = proc.child.id().is_some();
+        let lines = proc.output_lines.lock().await;
+        let tail_count = 50;
+        let output = if lines.len() > tail_count {
+            format!(
+                "({} lines total, showing last {})\n{}",
+                lines.len(),
+                tail_count,
+                lines[lines.len() - tail_count..].join("\n")
+            )
+        } else {
+            lines.join("\n")
+        };
+
+        let status = if is_running { "running" } else { "exited" };
+
+        Ok(CallToolResult::success(vec![Content::text(format!(
+            "# Process {} ({})\n\n{}\n\n---\n{} lines total",
+            process_id,
+            status,
+            output,
+            lines.len()
+        ))]))
+    }
+
+    async fn handle_write_stdin(
+        &self,
+        arguments: Option<JsonObject>,
+    ) -> Result<CallToolResult, String> {
+        let args = arguments.ok_or("Missing arguments")?;
+        let process_id = args
+            .get("process_id")
+            .and_then(|v| v.as_str())
+            .ok_or("Missing 'process_id' argument")?;
+        let input = args
+            .get("input")
+            .and_then(|v| v.as_str())
+            .ok_or("Missing 'input' argument")?;
+
+        let mut processes = self.processes.lock().await;
+        let proc = processes
+            .get_mut(process_id)
+            .ok_or_else(|| format!("Process '{}' not found", process_id))?;
+
+        let stdin = proc
+            .stdin
+            .as_mut()
+            .ok_or("Process stdin not available (already closed)")?;
+
+        stdin
+            .write_all(input.as_bytes())
+            .await
+            .map_err(|e| format!("Failed to write to stdin: {}", e))?;
+        stdin
+            .write_all(b"\n")
+            .await
+            .map_err(|e| format!("Failed to write newline: {}", e))?;
+        stdin
+            .flush()
+            .await
+            .map_err(|e| format!("Failed to flush stdin: {}", e))?;
+
+        Ok(CallToolResult::success(vec![Content::text(format!(
+            "Wrote to {}: {}",
+            process_id, input
+        ))]))
+    }
+
+    async fn handle_stop(&self, arguments: Option<JsonObject>) -> Result<CallToolResult, String> {
+        let args = arguments.ok_or("Missing arguments")?;
+        let process_id = args
+            .get("process_id")
+            .and_then(|v| v.as_str())
+            .ok_or("Missing 'process_id' argument")?;
+
+        let mut processes = self.processes.lock().await;
+        if let Some(mut proc) = processes.remove(process_id) {
+            let _ = proc.child.kill().await;
+            let status = proc.child.wait().await.ok();
+            let exit_code = status.and_then(|s| s.code());
+
+            self.context.task_registry.lock().await.cancel(process_id);
+
+            Ok(CallToolResult::success(vec![Content::text(format!(
+                "Process {} stopped. Exit code: {:?}",
+                process_id, exit_code
+            ))]))
+        } else {
+            let mut reg = self.context.task_registry.lock().await;
+            if reg.get(process_id).is_some() {
+                reg.cancel(process_id);
+                return Ok(CallToolResult::success(vec![Content::text(format!(
+                    "Task {} cancelled.",
+                    process_id
+                ))]));
+            }
+            Err(format!("Task '{}' not found", process_id))
+        }
+    }
+
+    async fn handle_schedule_reminder(
+        &self,
+        arguments: Option<JsonObject>,
+    ) -> Result<CallToolResult, String> {
+        let args = arguments.ok_or("Missing arguments")?;
+        let delay_str = args
+            .get("delay")
+            .and_then(|v| v.as_str())
+            .ok_or("Missing 'delay' argument")?;
+        let message = args
+            .get("message")
+            .and_then(|v| v.as_str())
+            .ok_or("Missing 'message' argument")?
+            .to_string();
+
+        let duration = humantime::parse_duration(delay_str)
+            .map_err(|e| format!("Invalid delay '{}': {}", delay_str, e))?;
+
+        let mut id_lock = self.next_id.lock().await;
+        let id = format!("timer_{}", *id_lock);
+        *id_lock += 1;
+        drop(id_lock);
+
+        let registry = &self.context.task_registry;
+        let deadline = std::time::Instant::now() + duration;
+        let task = Task {
+            id: id.clone(),
+            source: TaskSource::Timer,
+            description: message.clone(),
+            state: TaskState::Working,
+            batch_id: None,
+            notify_policy: NotifyPolicy::OnCompletion,
+            meta: crate::tasks::TaskMeta {
+                deadline: Some(deadline),
+                ..Default::default()
+            },
+            created_at: std::time::Instant::now(),
+            last_activity: std::time::Instant::now(),
+            worked_duration: std::time::Duration::default(),
+            notifications: Vec::new(),
+            status_message: None,
+            result: None,
+            error: None,
+            result_summary: None,
+            input_request: None,
+            ttl_ms: None,
+            poll_interval_ms: None,
+            cancellation_token: None,
+        };
+        registry.lock().await.register(task);
+
+        let reg = Arc::clone(registry);
+        let task_id = id.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(duration).await;
+            reg.lock().await.complete(&task_id, Some(message));
+        });
+
+        let human_dur = humantime::format_duration(duration);
+        Ok(CallToolResult::success(vec![Content::text(format!(
+            "Reminder scheduled: {} (fires in {}). Task ID: {}",
+            args.get("message").unwrap().as_str().unwrap(),
+            human_dur,
+            id
+        ))]))
+    }
+
+    async fn handle_list_tasks(&self) -> Result<CallToolResult, String> {
+        let registry = &self.context.task_registry;
+
+        let reg = registry.lock().await;
+        let jobs = reg.running();
+        if jobs.is_empty() {
+            return Ok(CallToolResult::success(vec![Content::text(
+                "No active tasks.",
+            )]));
+        }
+
+        let now = std::time::Instant::now();
+        let lines: Vec<String> = jobs
+            .iter()
+            .map(|j| {
+                let state_str = match j.state {
+                    TaskState::Working => {
+                        if let Some(deadline) = j.meta.deadline {
+                            if deadline > now {
+                                let remaining = deadline - now;
+                                format!(
+                                    "Working ({} remaining)",
+                                    humantime::format_duration(remaining)
+                                )
+                            } else {
+                                "Working (firing...)".to_string()
+                            }
+                        } else {
+                            "Working".to_string()
+                        }
+                    }
+                    _ => format!("{:?}", j.state),
+                };
+                let source = match j.source {
+                    TaskSource::Timer => "timer",
+                    TaskSource::Process => "process",
+                    TaskSource::Subagent => "subagent",
+                    _ => "task",
+                };
+                format!(
+                    "• {} [{}] {}: \"{}\"",
+                    j.id, source, state_str, j.description
+                )
+            })
+            .collect();
+
+        Ok(CallToolResult::success(vec![Content::text(
+            lines.join("\n"),
+        )]))
+    }
+
+    async fn handle_cancel_task(
+        &self,
+        arguments: Option<JsonObject>,
+    ) -> Result<CallToolResult, String> {
+        let task_id = arguments
+            .as_ref()
+            .and_then(|a| a.get("task_id"))
+            .and_then(|v| v.as_str())
+            .ok_or_else(|| "Missing required parameter: task_id".to_string())?;
+
+        // If this is a process task, kill the OS process first
+        let mut processes = self.processes.lock().await;
+        if let Some(mut proc) = processes.remove(task_id) {
+            let _ = proc.child.kill().await;
+            let _ = proc.child.wait().await;
+        }
+        drop(processes);
+
+        let mut registry = self.context.task_registry.lock().await;
+        if registry.get(task_id).is_none() {
+            return Err(format!("Task '{}' not found", task_id));
+        }
+        registry.cancel(task_id);
+        drop(registry);
+
+        Ok(CallToolResult::success(vec![Content::text(format!(
+            "Task {} cancelled.",
+            task_id
+        ))]))
+    }
+
+    async fn handle_get_task(
+        &self,
+        arguments: Option<JsonObject>,
+    ) -> Result<CallToolResult, String> {
+        let task_id = arguments
+            .as_ref()
+            .and_then(|a| a.get("task_id"))
+            .and_then(|v| v.as_str())
+            .ok_or_else(|| "Missing required parameter: task_id".to_string())?;
+
+        let mut registry = self.context.task_registry.lock().await;
+        let task = registry
+            .get(task_id)
+            .ok_or_else(|| format!("Task '{}' not found", task_id))?;
+
+        // InputRequired — return the question, do NOT reap (task stays alive)
+        if task.state == TaskState::InputRequired {
+            let description = task.description.clone();
+            let question = task.input_request.clone().unwrap_or_default();
+            let status_message = task.status_message.clone();
+            let duration = task.worked_duration;
+            drop(registry);
+
+            let mut parts = vec![format!(
+                "# Task Needs Input: {}\n\n\
+                 **Task:** {}\n\
+                 **Status:** ⏸ Input Required\n\
+                 **Duration:** {:.0?}",
+                task_id, description, duration
+            )];
+            if let Some(msg) = status_message {
+                parts.push(format!("\n**Status Message:** {}", msg));
+            }
+            parts.push(format!("\n## Question\n\n{}", question));
+
+            return Ok(CallToolResult::success(vec![Content::text(
+                parts.join("\n"),
+            )]));
+        }
+
+        // Working — still running, not ready to read
+        if !task.state.is_terminal() {
+            return Err(format!(
+                "Task '{}' is still running (state: {:?}). Use list_tasks to check status, or cancel_task to cancel it.",
+                task_id, task.state
+            ));
+        }
+
+        let description = task.description.clone();
+        let state = task.state.clone();
+        let duration = task.worked_duration;
+        let status_message = task.status_message.clone();
+        let result = task.result.clone();
+        let error = task.error.clone();
+        let result_summary = task.result_summary.clone();
+
+        // Terminal state — reap (remove from registry)
+        registry.remove(task_id);
+        drop(registry);
+
+        let status = match state {
+            TaskState::Completed => "✓ Completed",
+            TaskState::Failed => "✗ Failed",
+            TaskState::Cancelled => "⊘ Cancelled",
+            _ => "Unknown",
+        };
+
+        let mut parts = vec![format!(
+            "# Task Result: {}\n\n\
+             **Task:** {}\n\
+             **Status:** {}\n\
+             **Duration:** {:.0?}",
+            task_id, description, status, duration
+        )];
+
+        if let Some(msg) = status_message {
+            parts.push(format!("\n**Status Message:** {}", msg));
+        }
+
+        if let Some(ref r) = result {
+            parts.push(format!(
+                "\n## Result\n\n{}",
+                serde_json::to_string_pretty(r).unwrap_or_default()
+            ));
+        } else if let Some(ref e) = error {
+            parts.push(format!(
+                "\n## Error\n\n{}",
+                serde_json::to_string_pretty(e).unwrap_or_default()
+            ));
+        } else if let Some(s) = result_summary {
+            parts.push(format!("\n## Output\n\n{}", s));
+        } else {
+            parts.push("\n## Output\n\nNo output available.".to_string());
+        }
+
+        Ok(CallToolResult::success(vec![Content::text(
+            parts.join("\n"),
+        )]))
+    }
+
+    async fn handle_update_task(
+        &self,
+        arguments: Option<JsonObject>,
+    ) -> Result<CallToolResult, String> {
+        let task_id = arguments
+            .as_ref()
+            .and_then(|a| a.get("task_id"))
+            .and_then(|v| v.as_str())
+            .ok_or_else(|| "Missing required parameter: task_id".to_string())?;
+
+        // Validate input parameter exists
+        arguments
+            .as_ref()
+            .and_then(|a| a.get("input"))
+            .and_then(|v| v.as_str())
+            .ok_or_else(|| "Missing required parameter: input".to_string())?;
+
+        let mut registry = self.context.task_registry.lock().await;
+        let task = registry
+            .get(task_id)
+            .ok_or_else(|| format!("Task '{}' not found", task_id))?;
+
+        if task.state != TaskState::InputRequired {
+            return Err(format!(
+                "Task '{}' is not waiting for input (state: {:?}). Only tasks in InputRequired state can be updated.",
+                task_id, task.state
+            ));
+        }
+
+        // Store the input response and resume the task
+        registry.resume(task_id);
+        drop(registry);
+
+        Ok(CallToolResult::success(vec![Content::text(format!(
+            "Task {} updated with input and resumed.",
+            task_id
+        ))]))
+    }
+}
+
+#[async_trait]
+impl McpClientTrait for TasksClient {
+    async fn list_tools(
+        &self,
+        _session_id: &str,
+        _next_cursor: Option<String>,
+        _cancel_token: CancellationToken,
+    ) -> Result<ListToolsResult, Error> {
+        let tools = vec![
+            Tool::new(
+                "start_process",
+                "Start a long-running process in the background. Returns a process handle for monitoring and interaction.".to_string(),
+                serde_json::json!({
+                    "type": "object",
+                    "required": ["command"],
+                    "properties": {
+                        "command": {
+                            "type": "string",
+                            "description": "Shell command to run"
+                        },
+                        "wait_for": {
+                            "type": "string",
+                            "description": "Optional pattern to watch for in stdout. When matched, triggers a PatternMatched event (forced turn). The process keeps running."
+                        }
+                    }
+                }).as_object().unwrap().clone(),
+            ),
+            Tool::new(
+                "read_output",
+                "Read recent output (stdout/stderr) from a running process.".to_string(),
+                serde_json::json!({
+                    "type": "object",
+                    "required": ["process_id"],
+                    "properties": {
+                        "process_id": {
+                            "type": "string",
+                            "description": "Process handle from start_process"
+                        }
+                    }
+                }).as_object().unwrap().clone(),
+            ),
+            Tool::new(
+                "write_stdin",
+                "Write input to a running process's stdin.".to_string(),
+                serde_json::json!({
+                    "type": "object",
+                    "required": ["process_id", "input"],
+                    "properties": {
+                        "process_id": {
+                            "type": "string",
+                            "description": "Process handle from start_process"
+                        },
+                        "input": {
+                            "type": "string",
+                            "description": "Text to send to the process stdin"
+                        }
+                    }
+                }).as_object().unwrap().clone(),
+            ),
+            Tool::new(
+                "stop_process",
+                "Stop/kill a running process and get its exit status.".to_string(),
+                serde_json::json!({
+                    "type": "object",
+                    "required": ["process_id"],
+                    "properties": {
+                        "process_id": {
+                            "type": "string",
+                            "description": "Process handle from start_process"
+                        }
+                    }
+                }).as_object().unwrap().clone(),
+            ),
+            Tool::new(
+                "schedule_reminder",
+                "Schedule a timed reminder. Creates a task that fires after a delay, interrupting you with the given message. Use for checking back on async work, polling status, or any deferred action.".to_string(),
+                serde_json::json!({
+                    "type": "object",
+                    "required": ["delay", "message"],
+                    "properties": {
+                        "delay": {
+                            "type": "string",
+                            "description": "How long to wait before firing. Examples: 30s, 5m, 2h, 1h30m"
+                        },
+                        "message": {
+                            "type": "string",
+                            "description": "Reminder context injected when the timer fires"
+                        }
+                    }
+                }).as_object().unwrap().clone(),
+            ),
+            Tool::new(
+                "list_tasks",
+                "List all active background tasks (processes, timers, subagents) with their current status and time remaining.".to_string(),
+                serde_json::json!({
+                    "type": "object",
+                    "properties": {}
+                }).as_object().unwrap().clone(),
+            ),
+            Tool::new(
+                "cancel_task",
+                "Cancel a running background task by its task ID. Works for any task type (process, timer, subagent, auto-promoted tool call).".to_string(),
+                serde_json::json!({
+                    "type": "object",
+                    "required": ["task_id"],
+                    "properties": {
+                        "task_id": {
+                            "type": "string",
+                            "description": "Task ID to cancel (e.g. from list_tasks or a Task ID returned by the system)"
+                        }
+                    }
+                }).as_object().unwrap().clone(),
+            ),
+            Tool::new(
+                "get_task",
+                "Retrieve and reap a completed background task by its task ID. Returns the task's output summary and status, then removes it from the task registry.".to_string(),
+                serde_json::json!({
+                    "type": "object",
+                    "required": ["task_id"],
+                    "properties": {
+                        "task_id": {
+                            "type": "string",
+                            "description": "Task ID to read (e.g. from list_tasks or a Task ID returned by the system)"
+                        }
+                    }
+                }).as_object().unwrap().clone(),
+            ),
+            Tool::new(
+                "update_task",
+                "Provide input to a task that is waiting for input (InputRequired state). Resumes the task with the provided input.".to_string(),
+                serde_json::json!({
+                    "type": "object",
+                    "required": ["task_id", "input"],
+                    "properties": {
+                        "task_id": {
+                            "type": "string",
+                            "description": "Task ID to update"
+                        },
+                        "input": {
+                            "type": "string",
+                            "description": "Input to provide to the task"
+                        }
+                    }
+                }).as_object().unwrap().clone(),
+            ),
+        ];
+
+        Ok(ListToolsResult {
+            tools,
+            next_cursor: None,
+            meta: None,
+        })
+    }
+
+    async fn call_tool(
+        &self,
+        _ctx: &ToolCallContext,
+        name: &str,
+        arguments: Option<JsonObject>,
+        _cancel_token: CancellationToken,
+    ) -> Result<CallToolResult, Error> {
+        let result = match name {
+            "start_process" => self.handle_start(arguments).await,
+            "read_output" => self.handle_read_output(arguments).await,
+            "write_stdin" => self.handle_write_stdin(arguments).await,
+            "stop_process" => self.handle_stop(arguments).await,
+            "schedule_reminder" => self.handle_schedule_reminder(arguments).await,
+            "list_tasks" => self.handle_list_tasks().await,
+            "cancel_task" => self.handle_cancel_task(arguments).await,
+            "get_task" => self.handle_get_task(arguments).await,
+            "update_task" => self.handle_update_task(arguments).await,
+            _ => Err(format!("Unknown tool: {}", name)),
+        };
+
+        match result {
+            Ok(r) => Ok(r),
+            Err(e) => Ok(CallToolResult::error(vec![Content::text(format!(
+                "Error: {}",
+                e
+            ))])),
+        }
+    }
+
+    fn get_info(&self) -> Option<&InitializeResult> {
+        Some(&self.info)
+    }
+}

@@ -17,6 +17,7 @@ use goose::agents::ExtensionLoadResult;
 use goose::gateway::manager::GatewayManager;
 #[cfg(feature = "local-inference")]
 use goose::providers::local_inference::InferenceRuntime;
+use goose::turn_queue::TurnQueue;
 
 type ExtensionLoadingTasks =
     Arc<Mutex<HashMap<String, Arc<Mutex<Option<JoinHandle<Vec<ExtensionLoadResult>>>>>>>>;
@@ -32,6 +33,8 @@ pub struct AppState {
     #[cfg(feature = "local-inference")]
     inference_runtime: Arc<OnceLock<Arc<InferenceRuntime>>>,
     session_buses: Arc<Mutex<HashMap<String, Arc<SessionEventBus>>>>,
+    task_watcher_sessions: Arc<Mutex<HashSet<String>>>,
+    turn_queues: Arc<Mutex<HashMap<String, TurnQueue>>>,
 }
 
 impl AppState {
@@ -52,6 +55,8 @@ impl AppState {
             #[cfg(feature = "local-inference")]
             inference_runtime: Arc::new(OnceLock::new()),
             session_buses: Arc::new(Mutex::new(HashMap::new())),
+            task_watcher_sessions: Arc::new(Mutex::new(HashSet::new())),
+            turn_queues: Arc::new(Mutex::new(HashMap::new())),
         }))
     }
 
@@ -173,5 +178,34 @@ impl AppState {
             tracing::error!("Failed to get agent: {}", e);
             StatusCode::INTERNAL_SERVER_ERROR
         })
+    }
+
+    /// Get or create the turn queue for a session.
+    pub async fn get_or_create_turn_queue(&self, session_id: &str) -> TurnQueue {
+        let mut queues = self.turn_queues.lock().await;
+        queues
+            .entry(session_id.to_string())
+            .or_insert_with(TurnQueue::new)
+            .clone()
+    }
+
+    /// Ensure a task watcher is running for this session. Idempotent — only
+    /// spawns once per session. Must be called after the agent is created and
+    /// extensions are loaded.
+    pub async fn ensure_task_watcher(
+        self: &Arc<Self>,
+        session_id: &str,
+        agent: &Arc<goose::agents::Agent>,
+    ) {
+        let mut watchers = self.task_watcher_sessions.lock().await;
+        if watchers.contains(session_id) {
+            return;
+        }
+
+        if let Some(rx) = agent.take_task_event_rx().await {
+            let turn_queue = self.get_or_create_turn_queue(session_id).await;
+            crate::task_watcher::spawn_task_watcher(session_id.to_string(), rx, turn_queue);
+            watchers.insert(session_id.to_string());
+        }
     }
 }

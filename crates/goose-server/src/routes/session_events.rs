@@ -385,6 +385,10 @@ pub async fn session_reply(
             }
         };
 
+        task_state
+            .ensure_task_watcher(&task_session_id, &agent)
+            .await;
+
         let session = match task_state
             .session_manager()
             .get_session(&task_session_id, true)
@@ -431,96 +435,118 @@ pub async fn session_reply(
         };
         all_messages.push(user_message.clone());
 
-        let mut stream = match agent
-            .reply(
-                user_message.clone(),
-                session_config,
-                Some(task_cancel.clone()),
-            )
-            .await
-        {
-            Ok(stream) => stream,
-            Err(e) => {
-                tracing::error!("Failed to start reply stream: {:?}", e);
-                publish(
-                    Some(task_request_id.clone()),
-                    MessageEvent::Error {
-                        error: e.to_string(),
-                    },
-                )
-                .await;
-                return;
-            }
-        };
+        let turn_queue = task_state.get_or_create_turn_queue(&task_session_id).await;
 
+        // Drive the initial turn, then loop to flush any queued items
+        // (task events or interrupts that arrived during the turn).
+        let mut next_message = user_message.clone();
+        let mut cancelled = false;
         loop {
-            tokio::select! {
-                _ = task_cancel.cancelled() => {
-                    tracing::info!("Agent task cancelled for request {}", task_request_id);
+            let mut stream = match agent
+                .reply(
+                    next_message.clone(),
+                    session_config.clone(),
+                    Some(task_cancel.clone()),
+                )
+                .await
+            {
+                Ok(stream) => stream,
+                Err(e) => {
+                    tracing::error!("Failed to start reply stream: {:?}", e);
+                    publish(
+                        Some(task_request_id.clone()),
+                        MessageEvent::Error {
+                            error: e.to_string(),
+                        },
+                    )
+                    .await;
                     break;
                 }
-                response = timeout(Duration::from_millis(500), stream.next()) => {
-                    match response {
-                        Ok(Some(Ok(AgentEvent::Message(message)))) => {
-                            for content in &message.content {
-                                track_tool_telemetry(content, all_messages.messages());
+            };
+
+            loop {
+                tokio::select! {
+                    _ = task_cancel.cancelled() => {
+                        tracing::info!("Agent task cancelled for request {}", task_request_id);
+                        cancelled = true;
+                        break;
+                    }
+                    response = timeout(Duration::from_millis(500), stream.next()) => {
+                        match response {
+                            Ok(Some(Ok(AgentEvent::Message(message)))) => {
+                                for content in &message.content {
+                                    track_tool_telemetry(content, all_messages.messages());
+                                }
+                                all_messages.push(message.clone());
+                                let token_state = get_token_state(
+                                    task_state.session_manager(),
+                                    &task_session_id,
+                                )
+                                .await;
+                                publish(
+                                    Some(task_request_id.clone()),
+                                    MessageEvent::Message {
+                                        message,
+                                        token_state,
+                                    },
+                                )
+                                .await;
                             }
-                            all_messages.push(message.clone());
-                            let token_state = get_token_state(
-                                task_state.session_manager(),
-                                &task_session_id,
-                            )
-                            .await;
-                            publish(
-                                Some(task_request_id.clone()),
-                                MessageEvent::Message {
-                                    message,
-                                    token_state,
-                                },
-                            )
-                            .await;
-                        }
-                        Ok(Some(Ok(AgentEvent::Usage(_)))) => {}
-                        Ok(Some(Ok(AgentEvent::HistoryReplaced(new_messages)))) => {
-                            all_messages = new_messages.clone();
-                            publish(
-                                Some(task_request_id.clone()),
-                                MessageEvent::UpdateConversation {
-                                    conversation: new_messages,
-                                },
-                            )
-                            .await;
-                        }
-                        Ok(Some(Ok(AgentEvent::McpNotification((notification_request_id, n))))) => {
-                            publish(
-                                Some(task_request_id.clone()),
-                                MessageEvent::Notification {
-                                    request_id: notification_request_id,
-                                    message: n,
-                                },
-                            )
-                            .await;
-                        }
-                        Ok(Some(Err(e))) => {
-                            tracing::error!("Error processing message: {}", e);
-                            publish(
-                                Some(task_request_id.clone()),
-                                MessageEvent::Error {
-                                    error: e.to_string(),
-                                },
-                            )
-                            .await;
-                            break;
-                        }
-                        Ok(None) => {
-                            break;
-                        }
-                        Err(_) => {
-                            // Timeout — check if the bus still has subscribers
-                            continue;
+                            Ok(Some(Ok(AgentEvent::Usage(_)))) => {}
+                            Ok(Some(Ok(AgentEvent::HistoryReplaced(new_messages)))) => {
+                                all_messages = new_messages.clone();
+                                publish(
+                                    Some(task_request_id.clone()),
+                                    MessageEvent::UpdateConversation {
+                                        conversation: new_messages,
+                                    },
+                                )
+                                .await;
+                            }
+                            Ok(Some(Ok(AgentEvent::McpNotification((notification_request_id, n))))) => {
+                                publish(
+                                    Some(task_request_id.clone()),
+                                    MessageEvent::Notification {
+                                        request_id: notification_request_id,
+                                        message: n,
+                                    },
+                                )
+                                .await;
+                            }
+                            Ok(Some(Err(e))) => {
+                                tracing::error!("Error processing message: {}", e);
+                                publish(
+                                    Some(task_request_id.clone()),
+                                    MessageEvent::Error {
+                                        error: e.to_string(),
+                                    },
+                                )
+                                .await;
+                                cancelled = true;
+                                break;
+                            }
+                            Ok(None) => {
+                                break;
+                            }
+                            Err(_) => {
+                                continue;
+                            }
                         }
                     }
                 }
+            }
+
+            if cancelled {
+                break;
+            }
+
+            // Check for queued items (task events that arrived during the turn)
+            match turn_queue.try_flush().await {
+                Some(queued_msg) => {
+                    all_messages.push(queued_msg.clone());
+                    next_message = queued_msg;
+                }
+                None => break,
             }
         }
 

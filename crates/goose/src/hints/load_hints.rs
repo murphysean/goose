@@ -23,7 +23,7 @@ pub fn get_context_filenames() -> Vec<String> {
         })
 }
 
-#[derive(Default)]
+#[derive(Default, Clone)]
 pub struct SubdirectoryHintTracker {
     loaded_dirs: HashSet<PathBuf>,
     pending_dirs: Vec<PathBuf>,

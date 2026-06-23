@@ -4793,6 +4793,7 @@ dependencies = [
  "hf-hub 1.0.0-rc.1",
  "http 1.4.2",
  "http-body-util",
+ "humantime",
  "icu_calendar",
  "icu_locale",
  "ignore",
