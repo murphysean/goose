@@ -104,38 +104,72 @@ pub fn collect_elicitation_input(message: &str, schema: &Value) -> io::Result<El
             continue;
         }
 
-        if let Some(options) = enum_values {
-            let opts: Vec<&str> = options.iter().filter_map(|v| v.as_str()).collect();
-            println!("  {}: {}", style("Options").dim(), opts.join(", "));
-        }
+        let is_password = field_type == "string"
+            && (field_schema
+                .get("writeOnly")
+                .and_then(|v| v.as_bool())
+                .unwrap_or(false)
+                || field_schema.get("format").and_then(|v| v.as_str()) == Some("password")
+                || name.to_lowercase().contains("password")
+                || name.to_lowercase().contains("secret")
+                || name.to_lowercase().contains("token"));
 
-        print!("{}", style(name).yellow());
-        if let Some(desc) = description {
-            print!(" {}", style(format!("({})", desc)).dim());
-        }
-        if is_required {
-            print!("{}", style("*").red());
-        }
-        if let Some(def) = default {
-            print!(" {}", style(format!("[{}]", format_default(def))).dim());
-        }
-        print!(": ");
-        io::stdout().flush()?;
-
-        let input = read_line()?;
-
-        if input.is_none() {
-            return Ok(ElicitationInput {
-                action: ElicitationAction::Cancel,
-                user_data: HashMap::new(),
-            });
-        }
-        let input = input.unwrap();
-
-        let value = if input.is_empty() {
-            default.cloned()
+        let value = if is_password {
+            let label = match description {
+                Some(desc) => format!("{} ({})", name, desc),
+                None => name.clone(),
+            };
+            match cliclack::password(&label).mask('*').interact() {
+                Ok(v) => {
+                    if v.is_empty() {
+                        default.cloned()
+                    } else {
+                        Some(parse_value(&v, field_type, enum_values))
+                    }
+                }
+                Err(e) if e.kind() == io::ErrorKind::Interrupted => {
+                    return Ok(ElicitationInput {
+                        action: ElicitationAction::Cancel,
+                        user_data: HashMap::new(),
+                    });
+                }
+                Err(e) => return Err(e),
+            }
         } else {
-            Some(parse_value(&input, field_type, enum_values))
+            if let Some(options) = enum_values {
+                let opts: Vec<&str> = options.iter().filter_map(|v| v.as_str()).collect();
+                println!("  {}: {}", style("Options").dim(), opts.join(", "));
+            }
+
+            print!("{}", style(name).yellow());
+            if let Some(desc) = description {
+                print!(" {}", style(format!("({})", desc)).dim());
+            }
+            if is_required {
+                print!("{}", style("*").red());
+            }
+            if let Some(def) = default {
+                print!(" {}", style(format!("[{}]", format_default(def))).dim());
+            }
+            print!(": ");
+            io::stdout().flush()?;
+
+            let input = read_line()?;
+
+            // Handle Ctrl+C / EOF for cancellation
+            if input.is_none() {
+                return Ok(ElicitationInput {
+                    action: ElicitationAction::Cancel,
+                    user_data: HashMap::new(),
+                });
+            }
+            let input = input.unwrap();
+
+            if input.is_empty() {
+                default.cloned()
+            } else {
+                Some(parse_value(&input, field_type, enum_values))
+            }
         };
 
         if let Some(v) = value {

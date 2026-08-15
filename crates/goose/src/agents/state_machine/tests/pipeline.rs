@@ -101,6 +101,7 @@ pub(super) struct TestPipeline {
     steer_queue: SteerQueue,
     max_turns: u32,
     scheduler: Option<Arc<crate::scheduler::Scheduler>>,
+    task_registry: crate::tasks::SharedTaskRegistry,
     _temp_dir: Arc<tempfile::TempDir>,
 }
 
@@ -115,6 +116,7 @@ impl TestPipeline {
             Arc::new(SteerOperation::new(
                 self.steer_queue.clone(),
                 self.hook_manager.clone(),
+                self.task_registry.clone(),
             )),
             Arc::new(MaxTurnsOperation::new(self.max_turns)),
             Arc::new(BangShellOperation::new()),
@@ -142,6 +144,7 @@ impl TestPipeline {
                 &self.goose_mode,
                 self.extension_manager.clone(),
                 self.hook_manager.clone(),
+                self.task_registry.clone(),
             )),
             Arc::new(UnknownToolOperation),
             Arc::new(RetryOperation::new(
@@ -743,6 +746,7 @@ async fn build_test_pipeline(
         None => provider,
     };
     let shared_provider = Arc::new(TokioMutex::new(Some(provider.clone())));
+    let (task_registry, _) = crate::tasks::create_task_registry();
     let extension_manager = Arc::new(ExtensionManager::new(
         shared_provider.clone(),
         session_manager.clone(),
@@ -755,6 +759,7 @@ async fn build_test_pipeline(
             host_info: None,
         },
         false,
+        task_registry.clone(),
     ));
     let permission_manager = Arc::new(PermissionManager::new(temp_dir.path().join("permissions")));
     let mut tool_inspection_manager = ToolInspectionManager::new();
@@ -791,6 +796,7 @@ async fn build_test_pipeline(
         steer_queue: Arc::new(tokio::sync::Mutex::new(VecDeque::new())),
         max_turns: MAX_TURNS,
         scheduler,
+        task_registry,
         _temp_dir: temp_dir,
     };
     let extension_manager = pipeline.extension_manager.clone();

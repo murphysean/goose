@@ -8,6 +8,7 @@ use futures::{FutureExt, StreamExt};
 use rmcp::model::{CallToolRequestParams, CallToolResult, ContentBlock, ErrorData, Role, Tool};
 
 use crate::agents::extension_manager::ExtensionManager;
+use crate::agents::platform_extensions::developer::shell::{shell_promotion_plan, ShellPromotion};
 use crate::agents::platform_extensions::MANAGE_EXTENSIONS_TOOL_NAME_COMPLETE;
 use crate::agents::state_machine::operation::{
     applied, messages_since_kickoff, not_applicable, yielded_with, Emitter, Operation,
@@ -84,6 +85,7 @@ pub struct ToolExecutionOperation<'a> {
     goose_mode: &'a Mutex<GooseMode>,
     extension_manager: Arc<ExtensionManager>,
     hook_manager: HookManager,
+    task_registry: crate::tasks::SharedTaskRegistry,
 }
 
 impl<'a> ToolExecutionOperation<'a> {
@@ -91,11 +93,13 @@ impl<'a> ToolExecutionOperation<'a> {
         goose_mode: &'a Mutex<GooseMode>,
         extension_manager: Arc<ExtensionManager>,
         hook_manager: HookManager,
+        task_registry: crate::tasks::SharedTaskRegistry,
     ) -> Self {
         Self {
             goose_mode,
             extension_manager,
             hook_manager,
+            task_registry,
         }
     }
 
@@ -217,7 +221,7 @@ impl<'a> ToolExecutionOperation<'a> {
 
     async fn dispatch_tool_call(
         &self,
-        tool_call: CallToolRequestParams,
+        mut tool_call: CallToolRequestParams,
         request_id: String,
         cancellation_token: CancellationToken,
         session: &Session,
@@ -253,6 +257,45 @@ impl<'a> ToolExecutionOperation<'a> {
             self.emit_extended_pre_hooks(&tool_call.name, tool_input.as_ref(), session)
                 .await;
 
+            // Determine whether the tasks extension is loaded before dispatching.
+            // If loaded, create a dedicated cancellation token so the agent can
+            // cancel the tool call later via cancel_task or load(cancel: true).
+            // If not loaded, use the session-level token (no auto-promotion).
+            let tasks_extension_loaded = self
+                .extension_manager
+                .is_extension_enabled(crate::agents::platform_extensions::tasks::EXTENSION_NAME)
+                .await;
+
+            let task_cancel_token = if tasks_extension_loaded {
+                CancellationToken::new()
+            } else {
+                cancellation_token
+            };
+
+            // Automatic Tool-to-Task Promotion
+            let is_elicitation = tool_call
+                .arguments
+                .as_ref()
+                .and_then(|a| a.get("elicit"))
+                .and_then(|v| v.as_bool())
+                .unwrap_or(false);
+
+            let name_lower = tool_call.name.to_lowercase();
+            let is_blocking_permission = is_elicitation
+                || name_lower.contains("permission")
+                || name_lower.contains("confirm")
+                || name_lower.contains("approve");
+
+            // Shell commands block for their own `--timeout` before promotion (and run
+            // uncapped once promoted). Resolve the plan before dispatching so the
+            // dispatched args can be rewritten (`timeout_secs: 0`). The mutation is
+            // applied to the dispatch clone below, not the recorded tool call.
+            let shell_promotion = if tasks_extension_loaded && !is_blocking_permission {
+                Some(shell_promotion_plan(&mut tool_call))
+            } else {
+                None
+            };
+
             let context = crate::agents::tool_execution::ToolCallContext::new(
                 session.id.clone(),
                 Some(session.working_dir.clone()),
@@ -260,9 +303,9 @@ impl<'a> ToolExecutionOperation<'a> {
             );
             let result = self
                 .extension_manager
-                .dispatch_tool_call(&context, tool_call.clone(), cancellation_token)
+                .dispatch_tool_call(&context, tool_call.clone(), task_cancel_token.clone())
                 .await;
-            let result = result.unwrap_or_else(|error| {
+            let mut result = result.unwrap_or_else(|error| {
                 #[cfg(feature = "telemetry")]
                 crate::posthog::emit_error(
                     "tool_execution_failed",
@@ -270,6 +313,140 @@ impl<'a> ToolExecutionOperation<'a> {
                 );
                 ToolCallResult::from(Err(error))
             });
+
+            if !tasks_extension_loaded || is_blocking_permission {
+                // Tool runs synchronously; the MCP-level timeout will handle cleanup.
+                tracing::debug!(
+                    "Skipping auto-promotion for {} (tasks loaded: {}, blocking/elicitation/permission: {})",
+                    tool_call.name, tasks_extension_loaded, is_blocking_permission
+                );
+                return Ok(self.with_post_hooks(result, &tool_call, session, result_span));
+            }
+
+            // `--timeout 0` on a shell call means "never promote": run synchronously
+            // until the command finishes.
+            if let Some(ShellPromotion::BlockIndefinitely) = shell_promotion {
+                return Ok(self.with_post_hooks(result, &tool_call, session, result_span));
+            }
+
+            let task_id = format!(
+                "task_{}_{}",
+                tool_call.name,
+                uuid::Uuid::new_v4()
+                    .as_simple()
+                    .to_string()
+                    .get(..8)
+                    .unwrap_or("00000000")
+            );
+            let description = format!("Tool call: {}", tool_call.name);
+            let registry = self.task_registry.clone();
+
+            // Register initial task state
+            {
+                let mut reg = registry.lock().await;
+                reg.register(crate::tasks::Task {
+                    id: task_id.clone(),
+                    source: crate::tasks::TaskSource::McpTool,
+                    description: description.clone(),
+                    state: crate::tasks::TaskState::Working,
+                    batch_id: None,
+                    notify_policy: crate::tasks::NotifyPolicy::OnCompletion,
+                    meta: Default::default(),
+                    created_at: std::time::Instant::now(),
+                    last_activity: std::time::Instant::now(),
+                    worked_duration: std::time::Duration::default(),
+                    notifications: Vec::new(),
+                    status_message: None,
+                    result: None,
+                    error: None,
+                    result_summary: None,
+                    input_request: None,
+                    ttl_ms: None,
+                    poll_interval_ms: None,
+                    cancellation_token: Some(task_cancel_token),
+                });
+            }
+
+            let original_fut = result.result;
+            let task_id_for_bg = task_id.clone();
+            let registry_for_bg = registry.clone();
+
+            // Spawn the tool call execution in the background
+            let mut tool_run_task = tokio::spawn(original_fut);
+
+            // Attempt snappy completion. Shell commands block for their own
+            // `--timeout`; every other tool keeps the global default.
+            let limit_ms: u64 = match shell_promotion {
+                Some(ShellPromotion::BlockFor(window)) => window.as_millis() as u64,
+                _ => crate::config::Config::global()
+                    .get_param("GOOSE_TOOL_EXECUTION_LIMIT_MS")
+                    .unwrap_or(10_000),
+            };
+            let snappy_timeout = std::time::Duration::from_millis(limit_ms);
+            match tokio::time::timeout(snappy_timeout, &mut tool_run_task).await {
+                Ok(join_res) => {
+                    // Finished fast - return result normally.
+                    // Clean up the task registry so it never triggers background notifications.
+                    let mut reg = registry.lock().await;
+                    reg.remove(&task_id);
+
+                    let res = join_res.unwrap_or_else(|e| {
+                        Err(ErrorData::new(
+                            rmcp::model::ErrorCode::INTERNAL_ERROR,
+                            e.to_string(),
+                            None,
+                        ))
+                    });
+                    result.result = Box::new(futures::future::ready(res));
+                }
+                _ => {
+                    // Timed out - promote to background task.
+                    // Spawn a watcher to update the registry upon completion.
+                    tokio::spawn(async move {
+                        let outcome = match tool_run_task.await {
+                            Ok(Ok(r)) => {
+                                let summary = r
+                                    .content
+                                    .iter()
+                                    .filter_map(|c| c.as_text().map(|t| t.text.clone()))
+                                    .collect::<Vec<_>>()
+                                    .join("\n");
+                                Some((true, summary))
+                            }
+                            Ok(Err(e)) => Some((false, e.message.to_string())),
+                            // The spawned tool task panicked or was aborted. Mark the
+                            // task failed so it never lingers in Working forever.
+                            Err(join_err) => {
+                                Some((false, format!("tool task failed: {join_err}")))
+                            }
+                        };
+                        if let Some((success, summary)) = outcome {
+                            let mut reg = registry_for_bg.lock().await;
+                            if success {
+                                reg.complete(&task_id_for_bg, Some(summary));
+                            } else {
+                                reg.fail(&task_id_for_bg, Some(summary));
+                            }
+                        }
+                    });
+
+                    let instruction = format!(
+                        "The tool '{}' is taking longer than expected and is now running in the background (Task ID: {}). \
+                         You may continue working if you can make progress without the result. \
+                         When the task completes, its result will be delivered in a subsequent message. \
+                         If you cannot make further progress without waiting for this task, \
+                         surrender to the user by providing a text response summarizing what you've done \
+                         and what you're waiting for.",
+                        tool_call.name, task_id
+                    );
+
+                    // Return a CallToolResult that tells the LLM to wait
+                    let mcp_res =
+                        CallToolResult::success(vec![rmcp::model::ContentBlock::text(instruction)]);
+                    result.result = Box::new(futures::future::ready(Ok(mcp_res)));
+                }
+            }
+
             Ok(self.with_post_hooks(result, &tool_call, session, result_span))
         }
         .instrument(span)
@@ -735,6 +912,30 @@ impl Operation for ToolExecutionOperation<'_> {
             .collect();
         let mut extension_change_failed = false;
 
+        let executing_tools: Vec<&str> = pending
+            .iter()
+            .filter(|(_, disposition)| *disposition == ToolDisposition::Execute)
+            .filter_map(|(request, _)| {
+                request
+                    .tool_call
+                    .as_ref()
+                    .ok()
+                    .map(|tool_call| tool_call.name.as_ref())
+            })
+            .collect();
+        if !executing_tools.is_empty() {
+            let exec_msg = if executing_tools.len() == 1 {
+                format!("Executing tool: {}...", executing_tools[0])
+            } else {
+                format!("Executing tools: {}...", executing_tools.join(", "))
+            };
+            emit.message(Message::assistant().with_system_notification(
+                crate::conversation::message::SystemNotificationType::ThinkingMessage,
+                exec_msg,
+            ))
+            .await;
+        }
+
         let mut tool_streams = Vec::new();
         for (request, disposition) in &pending {
             if *disposition != ToolDisposition::Execute {
@@ -821,7 +1022,26 @@ impl Operation for ToolExecutionOperation<'_> {
                                 .iter()
                                 .find(|r| r.id == request_id)
                                 .and_then(|r| r.metadata.as_ref());
+                            let tool_name = requests
+                                .iter()
+                                .find(|r| r.id == request_id)
+                                .and_then(|r| r.tool_call.as_ref().ok())
+                                .map(|tool_call| tool_call.name.as_ref())
+                                .unwrap_or("unknown");
+                            let status_str = if output.is_ok() {
+                                "completed successfully"
+                            } else {
+                                "failed"
+                            };
                             response.add_tool_response_with_metadata(request_id, output, metadata);
+                            emit
+                                .message(
+                                    Message::assistant().with_system_notification(
+                                        crate::conversation::message::SystemNotificationType::InlineMessage,
+                                        format!("Tool '{}' {}", tool_name, status_str),
+                                    ),
+                                )
+                                .await;
                         }
                         ToolStreamItem::Message(msg) => {
                             emit.emit(AgentEvent::McpNotification((request_id, msg)))
@@ -860,6 +1080,25 @@ impl Operation for ToolExecutionOperation<'_> {
 
         let response = emit.message(response).await;
         effects.push(response.into());
+
+        // If background tasks are still running and the agent has already
+        // delivered its response for this turn, don't re-prompt the LLM.
+        // Yield control to the session loop, which will wait for task
+        // completions (batched via the turn queue) and re-enter the agent
+        // when results arrive. This prevents the LLM from making more tool
+        // calls while tasks are still in flight, but lets a turn that is
+        // mid-response to a user question continue until it answers.
+        let has_running = {
+            let reg = self.task_registry.lock().await;
+            !reg.running().is_empty()
+        };
+        let turn_complete = crate::agents::state_machine::operation::ends_turn(
+            messages_since_kickoff(conversation)?,
+        );
+        if has_running && turn_complete {
+            return yielded_with(effects);
+        }
+
         applied(effects)
     }
 }

@@ -1443,15 +1443,14 @@ pub fn display_banner(banners: &[String]) {
     }
 }
 
-pub fn display_context_usage(total_tokens: usize, context_limit: usize) {
+pub fn context_usage_line(total_tokens: usize, context_limit: usize) -> String {
     use console::style;
 
     if context_limit == 0 {
-        println!(
+        return format!(
             "  {}",
             style("context usage unavailable (context limit is 0)").dim()
         );
-        return;
     }
 
     let percentage =
@@ -1480,7 +1479,7 @@ pub fn display_context_usage(total_tokens: usize, context_limit: usize) {
         }
     }
 
-    println!(
+    format!(
         "  {} {} {}",
         colored_bar,
         style(format!("{}%", percentage)).dim(),
@@ -1490,7 +1489,7 @@ pub fn display_context_usage(total_tokens: usize, context_limit: usize) {
             format_tokens(context_limit)
         ))
         .dim(),
-    );
+    )
 }
 
 fn estimate_cost_usd(provider: &str, model: &str, usage: &Usage) -> Option<f64> {
@@ -1498,31 +1497,30 @@ fn estimate_cost_usd(provider: &str, model: &str, usage: &Usage) -> Option<f64> 
     canonical_model.cost.estimate_cost(usage)
 }
 
-/// Display cost information, if price data is available.
-pub fn display_cost_usage(provider: &str, model: &str, usage: &Usage) {
-    if let Some(cost) = estimate_cost_usd(provider, model, usage) {
-        use console::style;
-        let input_tokens = usage.input_tokens.unwrap_or(0);
-        let output_tokens = usage.output_tokens.unwrap_or(0);
-        let cache_read = usage.cache_read_input_tokens.unwrap_or(0);
-        let cache_write = usage.cache_write_input_tokens.unwrap_or(0);
+/// Build the cost line, if price data is available.
+pub fn cost_usage_line(provider: &str, model: &str, usage: &Usage) -> Option<String> {
+    let cost = estimate_cost_usd(provider, model, usage)?;
+    use console::style;
+    let input_tokens = usage.input_tokens.unwrap_or(0);
+    let output_tokens = usage.output_tokens.unwrap_or(0);
+    let cache_read = usage.cache_read_input_tokens.unwrap_or(0);
+    let cache_write = usage.cache_write_input_tokens.unwrap_or(0);
 
-        let cache_breakdown = match (cache_read, cache_write) {
-            (0, 0) => String::new(),
-            (read, 0) => format!(" ({} cache read)", read),
-            (0, write) => format!(" ({} cache write)", write),
-            (read, write) => format!(" ({} cache read, {} cache write)", read, write),
-        };
+    let cache_breakdown = match (cache_read, cache_write) {
+        (0, 0) => String::new(),
+        (read, 0) => format!(" ({} cache read)", read),
+        (0, write) => format!(" ({} cache write)", write),
+        (read, write) => format!(" ({} cache read, {} cache write)", read, write),
+    };
 
-        eprintln!(
-            "Cost: {} USD ({} tokens: in {}{}, out {})",
-            style(format!("${:.4}", cost)).cyan(),
-            input_tokens + output_tokens,
-            input_tokens,
-            cache_breakdown,
-            output_tokens
-        );
-    }
+    Some(format!(
+        "Cost: {} USD ({} tokens: in {}{}, out {})",
+        style(format!("${:.4}", cost)).cyan(),
+        input_tokens + output_tokens,
+        input_tokens,
+        cache_breakdown,
+        output_tokens
+    ))
 }
 
 pub struct McpSpinners {

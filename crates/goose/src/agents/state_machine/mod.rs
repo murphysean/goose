@@ -31,8 +31,8 @@ mod tests;
 
 pub use machine::{StateMachine, Step};
 pub use operation::{
-    applied, not_applicable, yielded, yielded_with, Emitter, Inference, InferenceInput, Operation,
-    OperationResult, SlashCommand, StateEffect, StepResult,
+    applied, ends_turn, not_applicable, yielded, yielded_with, Emitter, Inference, InferenceInput,
+    Operation, OperationResult, SlashCommand, StateEffect, StepResult,
 };
 
 pub(super) use ops_bang_shell::{bang_shell_command, BangShellOperation};

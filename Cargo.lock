@@ -4991,6 +4991,7 @@ dependencies = [
  "goose-sdk-types",
  "goose-test-support",
  "http 1.4.2",
+ "humantime",
  "icu_calendar",
  "icu_locale",
  "ignore",
@@ -5007,6 +5008,7 @@ dependencies = [
  "minijinja",
  "mockall",
  "nanoid",
+ "nix",
  "nostr",
  "nostr-sdk",
  "oauth2",
@@ -5021,6 +5023,7 @@ dependencies = [
  "pctx_code_mode",
  "pem 4.0.0",
  "process-wrap",
+ "pty-process",
  "rand 0.10.2",
  "rayon",
  "rcgen",
@@ -5041,6 +5044,7 @@ dependencies = [
  "shellexpand",
  "smithy-transport-reqwest",
  "sqlx",
+ "strip-ansi-escapes",
  "strum 0.28.0",
  "subtle",
  "symphonia",
@@ -8564,6 +8568,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "pty-process"
+version = "0.5.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "71cec9e2670207c5ebb9e477763c74436af3b9091dd550b9fb3c1bec7f3ea266"
+dependencies = [
+ "rustix 1.1.4",
+ "tokio",
+]
+
+[[package]]
 name = "publicsuffix"
 version = "2.3.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -10770,6 +10784,15 @@ dependencies = [
  "unicode-bidi",
  "unicode-normalization",
  "unicode-properties",
+]
+
+[[package]]
+name = "strip-ansi-escapes"
+version = "0.2.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "2a8f8038e7e7969abb3f1b7c2a811225e9296da208539e0f79c5251d6cac0025"
+dependencies = [
+ "vte",
 ]
 
 [[package]]
@@ -13052,6 +13075,15 @@ name = "vsimd"
 version = "0.8.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "5c3082ca00d5a5ef149bb8b555a72ae84c9c59f7250f013ac822ac2e49b19c64"
+
+[[package]]
+name = "vte"
+version = "0.14.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "231fdcd7ef3037e8330d8e17e61011a2c244126acc0a982f4040ac3f9f0bc077"
+dependencies = [
+ "memchr",
+]
 
 [[package]]
 name = "walkdir"

@@ -523,12 +523,14 @@ mod tests {
         )
         .await
         .unwrap();
+        let (task_registry, _) = crate::tasks::create_task_registry();
         let context = PlatformExtensionContext {
             extension_manager: None,
             session_manager,
             scheduler: Some(scheduler),
             session: Some(Arc::new(session)),
             use_login_shell_path: false,
+            task_registry,
         };
 
         let mut extensions: Vec<ExtensionInfo> = PLATFORM_EXTENSIONS

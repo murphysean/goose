@@ -9,7 +9,7 @@ use std::sync::Arc;
 use std::sync::Mutex;
 use std::time::Duration;
 
-use rmcp::model::{Annotations, CallToolResult, ContentBlock, TextContent};
+use rmcp::model::{Annotations, CallToolRequestParams, CallToolResult, ContentBlock, TextContent};
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use tokio::io::{AsyncBufReadExt, BufReader};
@@ -179,8 +179,11 @@ struct TruncationInfo {
 #[derive(Debug, Deserialize, JsonSchema)]
 pub struct ShellParams {
     pub command: String,
-    /// Maximum time in seconds to allow the command to run before it is killed.
-    /// If omitted, defaults to DEFAULT_EXTENSION_TIMEOUT.
+    /// How long (in seconds) to run the command synchronously before handing it
+    /// off to a background task. A command still running after this is promoted
+    /// to a background task (manage it with the task tools) rather than killed.
+    /// 0 disables the timeout (run to completion synchronously). If omitted,
+    /// defaults to DEFAULT_EXTENSION_TIMEOUT.
     #[serde(default)]
     pub timeout_secs: Option<u64>,
 }
@@ -542,6 +545,55 @@ fn resolve_shell_timeout(timeout_secs: Option<u64>) -> u64 {
             .get_goose_default_extension_timeout()
             .unwrap_or(crate::config::DEFAULT_EXTENSION_TIMEOUT)
     })
+}
+
+/// The shell tool as exposed to the model (developer extension, prefixed).
+pub(crate) const SHELL_TOOL_NAME: &str = "developer__shell";
+
+/// How a shell tool call should be handled by the tool-to-task promotion path.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ShellPromotion {
+    /// Not a shell call; fall back to the global `GOOSE_TOOL_EXECUTION_LIMIT_MS`.
+    NotShell,
+    /// `--timeout 0`: never promote; run synchronously until the command finishes.
+    BlockIndefinitely,
+    /// Block for this long, then promote to a background task if still running.
+    BlockFor(Duration),
+}
+
+/// Resolve the promotion plan for a shell call from its `timeout_secs` argument,
+/// and rewrite the call so the command runs uncapped (`timeout_secs: 0`). Once a
+/// command is promoted the task system owns its lifecycle, so the shell's own
+/// kill-timeout must not fire at the block window.
+pub(crate) fn shell_promotion_plan(tool_call: &mut CallToolRequestParams) -> ShellPromotion {
+    if tool_call.name != SHELL_TOOL_NAME {
+        return ShellPromotion::NotShell;
+    }
+    let timeout_secs = tool_call
+        .arguments
+        .as_ref()
+        .and_then(|a| a.get("timeout_secs"))
+        .and_then(|v| v.as_u64());
+    match timeout_secs {
+        Some(0) => ShellPromotion::BlockIndefinitely,
+        Some(secs) => {
+            // Rewrite so the command is never killed by the shell timeout; the
+            // block window below is what decides whether it goes background.
+            if let Some(args) = tool_call.arguments.as_mut() {
+                args.insert("timeout_secs".into(), serde_json::json!(0));
+            }
+            ShellPromotion::BlockFor(Duration::from_secs(secs))
+        }
+        None => {
+            let default_secs = crate::config::Config::global()
+                .get_goose_default_extension_timeout()
+                .unwrap_or(crate::config::DEFAULT_EXTENSION_TIMEOUT);
+            if let Some(args) = tool_call.arguments.as_mut() {
+                args.insert("timeout_secs".into(), serde_json::json!(0));
+            }
+            ShellPromotion::BlockFor(Duration::from_secs(default_secs))
+        }
+    }
 }
 
 async fn run_command(
@@ -1371,5 +1423,72 @@ mod tests {
             "killed process should have no exit code"
         );
         assert!(extract_text(&result).contains("Command timed out after 1 seconds"));
+    }
+
+    fn shell_call(timeout_secs: Option<u64>) -> CallToolRequestParams {
+        let mut args = serde_json::json!({ "command": "echo hi" })
+            .as_object()
+            .unwrap()
+            .clone();
+        if let Some(secs) = timeout_secs {
+            args.insert("timeout_secs".into(), serde_json::json!(secs));
+        }
+        CallToolRequestParams::new("developer__shell".to_string()).with_arguments(args)
+    }
+
+    #[test]
+    fn promotion_plan_non_shell_tool_untouched() {
+        let mut call = CallToolRequestParams::new("developer__write".to_string()).with_arguments(
+            serde_json::json!({ "path": "/tmp/x" })
+                .as_object()
+                .unwrap()
+                .clone(),
+        );
+        assert_eq!(shell_promotion_plan(&mut call), ShellPromotion::NotShell);
+        assert_eq!(call.arguments.as_ref().unwrap().get("timeout_secs"), None);
+    }
+
+    #[test]
+    fn promotion_plan_shell_default_timeout_rewrites_to_uncapped() {
+        let mut call = shell_call(None);
+        assert_eq!(
+            shell_promotion_plan(&mut call),
+            ShellPromotion::BlockFor(Duration::from_secs(
+                crate::config::Config::global()
+                    .get_goose_default_extension_timeout()
+                    .unwrap_or(crate::config::DEFAULT_EXTENSION_TIMEOUT)
+            ))
+        );
+        assert_eq!(
+            call.arguments.as_ref().unwrap().get("timeout_secs"),
+            Some(&serde_json::json!(0))
+        );
+    }
+
+    #[test]
+    fn promotion_plan_shell_explicit_timeout_is_block_window() {
+        let mut call = shell_call(Some(60));
+        assert_eq!(
+            shell_promotion_plan(&mut call),
+            ShellPromotion::BlockFor(Duration::from_secs(60))
+        );
+        assert_eq!(
+            call.arguments.as_ref().unwrap().get("timeout_secs"),
+            Some(&serde_json::json!(0))
+        );
+    }
+
+    #[test]
+    fn promotion_plan_shell_zero_timeout_never_promotes() {
+        let mut call = shell_call(Some(0));
+        assert_eq!(
+            shell_promotion_plan(&mut call),
+            ShellPromotion::BlockIndefinitely
+        );
+        // Args already uncapped; left as the model wrote them.
+        assert_eq!(
+            call.arguments.as_ref().unwrap().get("timeout_secs"),
+            Some(&serde_json::json!(0))
+        );
     }
 }

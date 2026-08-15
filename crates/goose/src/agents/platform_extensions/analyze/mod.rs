@@ -276,12 +276,14 @@ mod tests {
     use tempfile::tempdir;
 
     fn ctx() -> PlatformExtensionContext {
+        let (task_registry, _) = crate::tasks::create_task_registry();
         PlatformExtensionContext {
             extension_manager: None,
             session_manager: Arc::new(SessionManager::new(std::env::temp_dir())),
             scheduler: None,
             session: None,
             use_login_shell_path: false,
+            task_registry,
         }
     }
 

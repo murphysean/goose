@@ -138,7 +138,12 @@ impl DeveloperClient {
                      (set GOOSE_SHELL to override) - write command strings in that shell's \
                      syntax. Returns an object with stdout and stderr as separate fields. The \
                      output of each stream is limited to up to 2000 lines, and longer outputs \
-                     will be saved to a temporary file.",
+                     will be saved to a temporary file. The command blocks for `timeout_secs` \
+                     (default 300); if it is still running after that it is handed off to a \
+                     background task instead of being killed, and keeps running until it \
+                     finishes or is cancelled - manage it with the task tools \
+                     (task/list, task/load, task/cancel). Set `timeout_secs: 0` to never hand \
+                     off and always wait for the command to finish.",
                     shell = shell_display_name(),
                 ),
                 Self::schema::<ShellParams>(),
@@ -286,12 +291,14 @@ mod tests {
     }
 
     fn test_context(data_dir: std::path::PathBuf) -> PlatformExtensionContext {
+        let (task_registry, _) = crate::tasks::create_task_registry();
         PlatformExtensionContext {
             extension_manager: None,
             session_manager: Arc::new(SessionManager::new(data_dir)),
             scheduler: None,
             session: None,
             use_login_shell_path: false,
+            task_registry,
         }
     }
 

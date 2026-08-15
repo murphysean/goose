@@ -1,4 +1,4 @@
-STDIN: {"jsonrpc":"2.0","id":0,"method":"initialize","params":{"protocolVersion":"2025-11-25","capabilities":{"extensions":{"io.modelcontextprotocol/ui":{"mimeTypes":["text/html;profile=mcp-app"]}},"roots":{},"sampling":{},"elicitation":{}},"clientInfo":{"name":"goose-desktop","version":"0.0.0"}}}
+STDIN: {"jsonrpc":"2.0","id":0,"method":"initialize","params":{"protocolVersion":"2025-11-25","capabilities":{"extensions":{"io.modelcontextprotocol/ui":{"mimeTypes":["text/html;profile=mcp-app"]},"io.goose/interruptable":{},"io.modelcontextprotocol/tasks":{}},"roots":{},"sampling":{},"elicitation":{}},"clientInfo":{"name":"goose-desktop","version":"0.0.0"}}}
 STDERR: time=2026-07-29T10:52:54.153-04:00 level=INFO msg="starting server" version=1.7.0 host="" readOnly=false lockdownEnabled=false
 STDERR: GitHub MCP Server running on stdio
 STDERR: time=2026-07-29T10:52:54.158-04:00 level=INFO msg="server run start"

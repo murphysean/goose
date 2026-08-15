@@ -249,6 +249,7 @@ async fn test_replayed_session(
     let session_manager = Arc::new(goose::session::SessionManager::new(
         temp_dir.path().to_path_buf(),
     ));
+    let (task_registry, _task_rx) = goose::tasks::create_task_registry();
     let extension_manager = Arc::new(ExtensionManager::new(
         provider,
         session_manager,
@@ -259,6 +260,7 @@ async fn test_replayed_session(
             host_info: None,
         },
         true,
+        task_registry,
     ));
 
     #[allow(clippy::redundant_closure_call)]

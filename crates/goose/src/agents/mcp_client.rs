@@ -183,6 +183,8 @@ impl Drop for ActiveToolCallGuard {
 
 pub struct GooseClient {
     notification_handlers: Arc<Mutex<Vec<Sender<ServerNotification>>>>,
+    notification_broadcast: Option<tokio::sync::broadcast::Sender<(String, ServerNotification)>>,
+    extension_name: String,
     provider: SharedProvider,
     session_id: Mutex<Option<String>>,
     active_tool_calls: Arc<StdMutex<HashMap<String, Vec<String>>>>,
@@ -205,6 +207,8 @@ impl GooseClient {
     ) -> Self {
         GooseClient {
             notification_handlers: handlers,
+            notification_broadcast: None,
+            extension_name: client_name.clone(),
             provider,
             session_id: Mutex::new(None),
             active_tool_calls: Arc::new(StdMutex::new(HashMap::new())),
@@ -214,6 +218,17 @@ impl GooseClient {
             action_required,
             extension_manager,
         }
+    }
+
+    /// Attach a broadcast sender for forwarding all notifications to a central bus.
+    pub fn with_notification_broadcast(
+        mut self,
+        sender: tokio::sync::broadcast::Sender<(String, ServerNotification)>,
+        extension_name: String,
+    ) -> Self {
+        self.notification_broadcast = Some(sender);
+        self.extension_name = extension_name;
+        self
     }
 
     pub fn shared_working_dir(&self) -> Arc<tokio::sync::RwLock<PathBuf>> {
@@ -315,15 +330,33 @@ impl GooseClient {
     fn resolved_extensions(&self) -> ExtensionCapabilities {
         if let Some(host_info) = &self.capabilities.host_info {
             if host_info.explicit_extensions {
-                return host_info.extensions.clone();
+                let mut ext = host_info.extensions.clone();
+                ext.insert("io.goose/interruptable".to_string(), JsonObject::new());
+                ext.insert(
+                    "io.modelcontextprotocol/tasks".to_string(),
+                    JsonObject::new(),
+                );
+                return ext;
             }
         }
 
         if self.capabilities.mcpui {
-            return default_mcp_apps_ui_extensions();
+            let mut ext = default_mcp_apps_ui_extensions();
+            ext.insert("io.goose/interruptable".to_string(), JsonObject::new());
+            ext.insert(
+                "io.modelcontextprotocol/tasks".to_string(),
+                JsonObject::new(),
+            );
+            return ext;
         }
 
-        ExtensionCapabilities::new()
+        let mut ext = ExtensionCapabilities::new();
+        ext.insert("io.goose/interruptable".to_string(), JsonObject::new());
+        ext.insert(
+            "io.modelcontextprotocol/tasks".to_string(),
+            JsonObject::new(),
+        );
+        ext
     }
 
     fn resolved_client_info(&self) -> Implementation {
@@ -383,10 +416,11 @@ impl ClientHandler for GooseClient {
     ) {
         let mut not = Notification::new(params);
         not.extensions = context.extensions;
-        fan_out_notification(
-            &mut *self.notification_handlers.lock().await,
-            ServerNotification::ProgressNotification(not),
-        );
+        let notification = ServerNotification::ProgressNotification(not);
+        if let Some(ref broadcast) = self.notification_broadcast {
+            let _ = broadcast.send((self.extension_name.clone(), notification.clone()));
+        }
+        fan_out_notification(&mut *self.notification_handlers.lock().await, notification);
     }
 
     async fn on_tool_list_changed(&self, _context: rmcp::service::NotificationContext<RoleClient>) {
@@ -401,9 +435,36 @@ impl ClientHandler for GooseClient {
     ) {
         let mut notification = LoggingMessageNotification::new(params);
         notification.extensions = context.extensions;
+        let server_notification = ServerNotification::LoggingMessageNotification(notification);
+        if let Some(ref broadcast) = self.notification_broadcast {
+            let _ = broadcast.send((self.extension_name.clone(), server_notification.clone()));
+        }
         fan_out_notification(
             &mut *self.notification_handlers.lock().await,
-            ServerNotification::LoggingMessageNotification(notification),
+            server_notification,
+        );
+    }
+
+    async fn on_resource_updated(
+        &self,
+        params: rmcp::model::ResourceUpdatedNotificationParam,
+        _context: rmcp::service::NotificationContext<rmcp::RoleClient>,
+    ) {
+        let notification = rmcp::model::ResourceUpdatedNotification::new(params.clone());
+        let server_notification = ServerNotification::ResourceUpdatedNotification(notification);
+        if let Some(ref broadcast) = self.notification_broadcast {
+            let _ = broadcast.send((self.extension_name.clone(), server_notification.clone()));
+        }
+        self.notification_handlers
+            .lock()
+            .await
+            .iter()
+            .for_each(|handler| {
+                let _ = handler.try_send(server_notification.clone());
+            });
+        tracing::info!(
+            uri = %params.uri,
+            "MCP resource updated notification received"
         );
     }
 
@@ -426,7 +487,13 @@ impl ClientHandler for GooseClient {
             .clone();
 
         // Prefer explicit MCP metadata, then the active request scope.
-        let session_id = self.resolve_session_id(&context.extensions).await;
+        let _session_id = self.resolve_session_id(&context.extensions).await;
+
+        // Emit notification that sampling was requested
+        tracing::info!(
+            client = %self.client_name,
+            "MCP server requested sampling/createMessage"
+        );
 
         let provider_ready_messages: Vec<crate::conversation::message::Message> = params
             .messages
@@ -449,6 +516,9 @@ impl ClientHandler for GooseClient {
             .as_deref()
             .unwrap_or("You are a general-purpose AI agent called goose");
 
+        // Pass through tools from the requesting MCP server (Track 6)
+        let tools = params.tools.as_deref().unwrap_or(&[]);
+
         let model_config = resolve_sampling_model_config().map_err(|e| {
             ErrorData::new(
                 ErrorCode::INTERNAL_ERROR,
@@ -456,18 +526,25 @@ impl ClientHandler for GooseClient {
                 Some(Value::from(e.to_string())),
             )
         })?;
-        let (response, usage) = crate::session_context::with_session_id(
-            session_id.clone(),
-            provider.complete(&model_config, system_prompt, &provider_ready_messages, &[]),
-        )
-        .await
-        .map_err(|e| {
-            ErrorData::new(
-                ErrorCode::INTERNAL_ERROR,
-                "Unexpected error while completing the prompt",
-                Some(Value::from(e.to_string())),
+        let (response, usage) = provider
+            .complete(
+                &model_config,
+                system_prompt,
+                &provider_ready_messages,
+                tools,
             )
-        })?;
+            .await
+            .map_err(|e| {
+                ErrorData::new(
+                    ErrorCode::INTERNAL_ERROR,
+                    "Unexpected error while completing the prompt",
+                    Some(Value::from(e.to_string())),
+                )
+            })?;
+
+        // TODO: If response contains tool_calls, route them back to the requesting
+        // server and loop until a final text response. For now, we return whatever
+        // the LLM produces (may include tool_call content that the server can handle).
 
         Ok(CreateMessageResult::new(
             SamplingMessage::new(
@@ -589,38 +666,17 @@ pub struct McpClient {
     docker_container: Option<String>,
 }
 
+/// Optional configuration for MCP client connections.
+#[derive(Default)]
+pub struct ConnectionOptions {
+    pub notification_broadcast:
+        Option<tokio::sync::broadcast::Sender<(String, ServerNotification)>>,
+    pub extension_name: Option<String>,
+}
+
 impl McpClient {
     #[allow(clippy::too_many_arguments)]
-    pub(crate) async fn connect<T, E, A>(
-        transport: T,
-        timeout: std::time::Duration,
-        provider: SharedProvider,
-        client_name: String,
-        capabilities: GooseMcpClientCapabilities,
-        working_dir: PathBuf,
-        action_required: Arc<ActionRequiredManager>,
-        extension_manager: Weak<ExtensionManager>,
-    ) -> Result<Self, ClientInitializeError>
-    where
-        T: IntoTransport<RoleClient, E, A>,
-        E: std::error::Error + From<std::io::Error> + Send + Sync + 'static,
-    {
-        Self::connect_with_container(
-            transport,
-            timeout,
-            provider,
-            None,
-            client_name,
-            capabilities,
-            working_dir,
-            action_required,
-            extension_manager,
-        )
-        .await
-    }
-
-    #[allow(clippy::too_many_arguments)]
-    pub(crate) async fn connect_with_container<T, E, A>(
+    pub(crate) async fn connect_with_options<T, E, A>(
         transport: T,
         timeout: std::time::Duration,
         provider: SharedProvider,
@@ -629,6 +685,7 @@ impl McpClient {
         capabilities: GooseMcpClientCapabilities,
         working_dir: PathBuf,
         action_required: Arc<ActionRequiredManager>,
+        opts: ConnectionOptions,
         extension_manager: Weak<ExtensionManager>,
     ) -> Result<Self, ClientInitializeError>
     where
@@ -638,7 +695,7 @@ impl McpClient {
         let notification_subscribers =
             Arc::new(Mutex::new(Vec::<mpsc::Sender<ServerNotification>>::new()));
 
-        let client = GooseClient::new(
+        let mut client = GooseClient::new(
             notification_subscribers.clone(),
             provider,
             client_name.clone(),
@@ -647,6 +704,10 @@ impl McpClient {
             action_required,
             extension_manager,
         );
+        if let Some(broadcast) = opts.notification_broadcast {
+            let ext_name = opts.extension_name.unwrap_or_else(|| client_name.clone());
+            client = client.with_notification_broadcast(broadcast, ext_name);
+        }
         let client: rmcp::service::RunningService<rmcp::RoleClient, GooseClient> =
             client.serve(transport).await?;
         let server_info = client.peer_info().map(|info| {

@@ -474,6 +474,22 @@ impl Inference for InferenceRunner<'_> {
             let mut usage_effects: Vec<StateEffect> =
                 turn_context.into_iter().map(StateEffect::from).collect();
 
+            // Not the first inference of the turn: let the user know the model
+            // is working while tools run in the background.
+            if turn
+                .iter()
+                .any(|message| message.role == rmcp::model::Role::Assistant)
+            {
+                emit
+                    .message(
+                        Message::assistant().with_system_notification(
+                            crate::conversation::message::SystemNotificationType::ThinkingMessage,
+                            "Waiting for model response...",
+                        ),
+                    )
+                    .await;
+            }
+
             let stream = crate::agents::reply_parts::stream_response_from_provider(
                 self.provider.clone(),
                 self.model_config.clone(),

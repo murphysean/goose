@@ -239,9 +239,17 @@ export default function JsonSchemaForm({
       );
     }
 
+    const isPassword = prop.type === 'string' && (
+      (prop as any).writeOnly === true ||
+      (prop as any).format === 'password' ||
+      key.toLowerCase().includes('password') ||
+      key.toLowerCase().includes('secret') ||
+      key.toLowerCase().includes('token')
+    );
+
     return (
       <Input
-        type="text"
+        type={isPassword ? "password" : "text"}
         id={key}
         value={String(value ?? '')}
         onChange={(e) => handleChange(key, e.target.value)}
