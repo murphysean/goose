@@ -1387,6 +1387,7 @@ impl ExtensionManager {
         client_name: String,
         capabilities: ExtensionManagerCapabilities,
         use_login_shell_path: bool,
+        task_registry: crate::tasks::SharedTaskRegistry,
     ) -> Self {
         Self {
             extensions: Mutex::new(HashMap::new()),
@@ -1396,6 +1397,7 @@ impl ExtensionManager {
                 scheduler,
                 session: None,
                 use_login_shell_path,
+                task_registry,
             },
             provider,
             tools_cache: Mutex::new(None),
@@ -1407,6 +1409,7 @@ impl ExtensionManager {
 
     pub fn new_without_provider(data_dir: std::path::PathBuf) -> Self {
         let session_manager = Arc::new(crate::session::SessionManager::new(data_dir));
+        let (task_registry, _) = crate::tasks::create_task_registry();
         Self::new(
             Arc::new(Mutex::new(None)),
             session_manager,
@@ -1419,6 +1422,7 @@ impl ExtensionManager {
                 protocol_version: None,
             },
             false,
+            task_registry,
         )
     }
 

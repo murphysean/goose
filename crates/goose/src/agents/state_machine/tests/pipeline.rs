@@ -783,6 +783,7 @@ async fn build_test_pipeline(
             protocol_version: None,
         },
         false,
+        crate::tasks::create_task_registry().0,
     ));
     let permission_manager = Arc::new(PermissionManager::new(temp_dir.path().join("permissions")));
     let mut tool_inspection_manager = ToolInspectionManager::new();

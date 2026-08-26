@@ -760,6 +760,7 @@ mod tests {
             scheduler: None,
             session: session.map(Arc::new),
             use_login_shell_path: false,
+            task_registry: crate::tasks::create_task_registry().0,
         })
         .unwrap()
     }

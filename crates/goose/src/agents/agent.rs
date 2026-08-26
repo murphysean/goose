@@ -39,8 +39,8 @@ use crate::agents::state_machine::{
     GooseInferenceProvider, GooseInferenceRequestPreparer, InferenceRunner, MaxTurnsOperation,
     Operation, ProjectOperation, RecipeOperation, RetryOperation, SkillOperation,
     SlashCommandOperation, StateMachine, StatusOperation, SteerOperation, SteerQueue, Step,
-    StopHookOperation, ToolApprovalOperation, ToolExecutionOperation, ToolPairCompactionOperation,
-    UnknownToolOperation, MAX_TURNS_MESSAGE,
+    StopHookOperation, TaskNotificationOperation, ToolApprovalOperation, ToolExecutionOperation,
+    ToolPairCompactionOperation, UnknownToolOperation, MAX_TURNS_MESSAGE,
 };
 use crate::agents::types::{
     SessionConfig, SharedProvider, DEFAULT_ON_FAILURE_TIMEOUT_SECONDS,
@@ -296,6 +296,12 @@ pub struct Agent {
     pub(super) tool_inspection_manager: ToolInspectionManager,
     pub(super) hook_manager: crate::hooks::HookManager,
     session_start_emitted: AtomicBool,
+    /// Shared task registry — also passed to the ExtensionManager so the tasks
+    /// extension and the agent observe the same set of background tasks.
+    pub task_registry: crate::tasks::SharedTaskRegistry,
+    /// Task event receiver — take this once to listen for actionable events
+    /// (task completion, needs-input, pattern matched).
+    pub task_event_rx: Mutex<Option<tokio::sync::mpsc::UnboundedReceiver<crate::tasks::TaskEvent>>>,
     #[cfg(test)]
     pub(super) stop_hook_block_cap_override: Option<u32>,
     container: Mutex<Option<Container>>,
@@ -437,6 +443,7 @@ impl Agent {
         let permission_manager = Arc::clone(&config.permission_manager);
         let use_login_shell_path = config.resolve_use_login_shell_path();
         let is_subagent = config.is_subagent;
+        let (task_registry, task_event_rx) = crate::tasks::create_task_registry();
         Self {
             provider: provider.clone(),
             config,
@@ -448,6 +455,7 @@ impl Agent {
                 client_name,
                 capabilities,
                 use_login_shell_path,
+                task_registry.clone(),
             )),
             final_output_tool: Arc::new(Mutex::new(None)),
             prompt_manager: Mutex::new(PromptManager::new()),
@@ -468,6 +476,8 @@ impl Agent {
                 )
             },
             session_start_emitted: AtomicBool::new(false),
+            task_registry,
+            task_event_rx: Mutex::new(Some(task_event_rx)),
             #[cfg(test)]
             stop_hook_block_cap_override: None,
             container: Mutex::new(None),
@@ -475,6 +485,15 @@ impl Agent {
             grind: Mutex::new(None),
             steer_queues: Mutex::new(HashMap::new()),
         }
+    }
+
+    /// Take the task event receiver. Call once to get the channel for listening
+    /// to actionable task events (batch completion, critical failures, etc.).
+    /// Returns None if already taken.
+    pub async fn take_task_event_rx(
+        &self,
+    ) -> Option<tokio::sync::mpsc::UnboundedReceiver<crate::tasks::TaskEvent>> {
+        self.task_event_rx.lock().await.take()
     }
 
     /// Emit a lifecycle hook event with no extra context. Useful for events
@@ -1671,6 +1690,7 @@ impl Agent {
 
         let mut operations: Vec<Arc<dyn Operation<Session, GooseEffect> + '_>> = vec![
             Arc::new(SteerOperation::new(steer_queue, self.hook_manager.clone())),
+            Arc::new(TaskNotificationOperation::new(self.task_registry.clone())),
             Arc::new(MaxTurnsOperation::new(max_turns)),
             Arc::new(BangShellOperation::new()),
         ];
@@ -2582,6 +2602,50 @@ impl Agent {
                         )
                         .await?;
                         yield AgentEvent::Message(message);
+                    }
+                }
+
+                // Legacy-loop parity for TaskNotificationOperation (state machine).
+                // The state-machine path drains finished tasks between pipeline
+                // steps via ops_task_notification; this block provides the same
+                // behavior in the legacy agent loop between turns.
+                if can_drain_pending_steers {
+                    let completed_tasks = {
+                        let reg = self.task_registry.lock().await;
+                        reg.finished().iter().map(|t| {
+                            let summary = t.result_summary.clone().unwrap_or_default();
+                            let id = t.id.clone();
+                            let desc = t.description.clone();
+                            let state = t.state.clone();
+                            (id, desc, summary, state)
+                        }).collect::<Vec<_>>()
+                    };
+                    if !completed_tasks.is_empty() {
+                        let mut reg = self.task_registry.lock().await;
+                        for (id, _, _, _) in &completed_tasks {
+                            reg.remove(id);
+                        }
+                        drop(reg);
+
+                        let mut batch = Vec::new();
+                        for (task_id, description, summary, state) in &completed_tasks {
+                            let state_str = match state {
+                                crate::tasks::TaskState::Completed => "completed",
+                                crate::tasks::TaskState::Failed => "failed",
+                                crate::tasks::TaskState::Cancelled => "cancelled",
+                                _ => "finished",
+                            };
+                            let msg = format!(
+                                "System: Background task '{}' ({}) {}.\nResult: {}",
+                                task_id, description, state_str, summary
+                            );
+                            batch.push(msg);
+                        }
+                        let steer_msg = Message::user().with_text(batch.join("\n\n"))
+                            .with_visibility(false, true);
+                        session_manager.add_message(&session_config.id, &steer_msg).await?;
+                        conversation.push(steer_msg.clone());
+                        yield AgentEvent::Message(steer_msg);
                     }
                 }
 

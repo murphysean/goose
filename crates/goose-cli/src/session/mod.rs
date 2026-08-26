@@ -49,7 +49,7 @@ use strum::VariantNames;
 use goose::config::paths::Paths;
 use goose::config::providers;
 use goose::conversation::message::{
-    ActionRequiredData, Message, MessageContent, ToolConfirmationRequest,
+    ActionRequiredData, Message, MessageContent, SystemNotificationType, ToolConfirmationRequest,
 };
 use goose::providers::inventory::ProviderInventoryService;
 use goose::session::SessionManager;
@@ -863,7 +863,8 @@ impl CliSession {
         match self.run_mode {
             RunMode::Normal => {
                 history.save(editor);
-                self.push_message(Message::user().with_text(content));
+                let message = self.prepend_task_notifications(content).await;
+                self.push_message(message);
 
                 let _provider = self.agent.provider().await?;
 
@@ -888,6 +889,51 @@ impl CliSession {
             }
         }
         Ok(())
+    }
+
+    /// Drain completed background tasks and prepend their notifications to the
+    /// user's message. This is an interim mechanism: the CLI input loop is
+    /// blocking, so the only point we can reliably surface task completions is
+    /// when the user submits a message and the agent is about to run.
+    async fn prepend_task_notifications(&self, content: &str) -> Message {
+        let completed_tasks = {
+            let reg = self.agent.task_registry.lock().await;
+            reg.finished()
+                .iter()
+                .map(|t| {
+                    let summary = t.result_summary.clone().unwrap_or_default();
+                    let id = t.id.clone();
+                    let desc = t.description.clone();
+                    let state = t.state.clone();
+                    (id, desc, summary, state)
+                })
+                .collect::<Vec<_>>()
+        };
+        if completed_tasks.is_empty() {
+            return Message::user().with_text(content);
+        }
+
+        {
+            let mut reg = self.agent.task_registry.lock().await;
+            for (id, _, _, _) in &completed_tasks {
+                reg.remove(id);
+            }
+        }
+
+        let mut message = Message::user();
+        let mut notification_text = String::new();
+        for (task_id, description, summary, state) in &completed_tasks {
+            let text = goose::tasks::task_completion_text(task_id, description, state, summary);
+            if !notification_text.is_empty() {
+                notification_text.push_str("\n\n");
+            }
+            notification_text.push_str(&text);
+            message = message.with_content(MessageContent::system_notification(
+                SystemNotificationType::InlineMessage,
+                text,
+            ));
+        }
+        message.with_text(format!("{}\n\n{}", notification_text, content))
     }
 
     fn handle_toggle_theme(&self) {

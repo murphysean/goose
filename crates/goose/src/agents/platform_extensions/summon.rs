@@ -2351,12 +2351,14 @@ mod tests {
     fn create_test_context_with_session_manager(
         session_manager: Arc<crate::session::SessionManager>,
     ) -> PlatformExtensionContext {
+        let (task_registry, _) = crate::tasks::create_task_registry();
         PlatformExtensionContext {
             extension_manager: None,
             session_manager,
             scheduler: None,
             session: None,
             use_login_shell_path: false,
+            task_registry,
         }
     }
 

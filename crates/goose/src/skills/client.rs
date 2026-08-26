@@ -336,6 +336,7 @@ mod tests {
             scheduler: None,
             session: Some(session),
             use_login_shell_path: false,
+            task_registry: crate::tasks::create_task_registry().0,
         })
         .unwrap()
         .with_builtin_skills(false)
@@ -483,6 +484,7 @@ mod tests {
             scheduler: None,
             session: Some(session),
             use_login_shell_path: false,
+            task_registry: crate::tasks::create_task_registry().0,
         })
         .unwrap()
         .with_builtin_skills(false);
@@ -532,6 +534,7 @@ mod tests {
             scheduler: None,
             session: None,
             use_login_shell_path: false,
+            task_registry: crate::tasks::create_task_registry().0,
         })
         .unwrap();
 
