@@ -51,6 +51,7 @@ pub mod slash_commands;
 pub mod source_roots;
 pub mod sources;
 pub use goose_agent::subprocess;
+pub mod tasks;
 pub mod token_counter;
 mod tool_call_labels;
 pub mod tool_inspection;

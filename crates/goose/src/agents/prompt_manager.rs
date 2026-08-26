@@ -567,6 +567,7 @@ mod tests {
             providers: Default::default(),
             session_manager,
             scheduler: Some(scheduler),
+            task_registry: crate::tasks::create_task_registry().0,
         };
 
         let mut extensions = Vec::new();

@@ -449,6 +449,7 @@ mod tests {
             providers: Default::default(),
             session_manager,
             scheduler: None,
+            task_registry: crate::tasks::create_task_registry().0,
         })
         .unwrap();
         let load_output = client

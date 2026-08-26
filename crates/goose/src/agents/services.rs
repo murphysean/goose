@@ -18,7 +18,7 @@ use crate::agents::session_runtime::{Attachment, SessionRuntime};
 use crate::agents::state_machine::{
     has_unapplied_tool_confirmation_response, pending_tool_confirmations,
     persist_tool_confirmation_decision, run_goose, AutoEffortOperation, Emitter, GooseEffect,
-    Operation, StateMachine, DEFAULT_BLOCK_CAP,
+    Operation, StateMachine, TaskNotificationOperation, DEFAULT_BLOCK_CAP,
 };
 use crate::agents::state_machine_builder::{build_state_machine, StateMachineConfig};
 use crate::agents::subagent_handler::ForegroundSubagentRunner;
@@ -331,6 +331,9 @@ pub struct StateMachineServices {
 
     pub extension_manager: Arc<ExtensionManager>,
 
+    pub task_registry: crate::tasks::SharedTaskRegistry,
+    task_event_rx: tokio::sync::Mutex<Option<mpsc::UnboundedReceiver<crate::tasks::TaskEvent>>>,
+
     pub(super) tool_inspection_manager: ToolInspectionManager,
     pub(super) hook_manager: crate::hooks::HookManager,
     turn_settings: Option<TurnSettings>,
@@ -359,12 +362,14 @@ impl StateMachineServices {
         let mut default_client = ClientContext::new(&config.goose_platform, None);
         default_client.capabilities.elicitation_handler = config.elicitation_handler;
         default_client.capabilities.protocol_version = config.mcp_protocol_version;
+        let (task_registry, task_event_rx) = crate::tasks::create_task_registry();
         let services = Arc::new(Self {
             extension_manager: Arc::new(ExtensionManager::new(
                 config.providers.clone(),
                 config.session_manager.clone(),
                 config.scheduler_service.clone(),
                 default_client,
+                task_registry.clone(),
             )),
             tool_inspection_manager: Self::create_tool_inspection_manager(
                 config.permission_manager.clone(),
@@ -382,6 +387,8 @@ impl StateMachineServices {
                 crate::hooks::HookManager::load(std::env::current_dir().ok().as_deref())
             }),
             turn_settings: config.turn_settings,
+            task_registry,
+            task_event_rx: tokio::sync::Mutex::new(Some(task_event_rx)),
         });
         services
             .runtime
@@ -399,6 +406,15 @@ impl StateMachineServices {
         self.runtime.steer(session_id, message).await;
         self.emit_user_prompt_submit(&session, prompt).await;
         Ok(())
+    }
+
+    /// Take the task event receiver. Call once to listen for actionable task
+    /// events (completion, needs-input, pattern matched). Returns `None` if it
+    /// has already been taken.
+    pub async fn take_task_event_rx(
+        &self,
+    ) -> Option<mpsc::UnboundedReceiver<crate::tasks::TaskEvent>> {
+        self.task_event_rx.lock().await.take()
     }
 
     pub fn discard_pending_steers(&self, session_id: &str) {
@@ -742,6 +758,12 @@ impl StateMachineServices {
             crate::context_mgmt::compute_tool_call_cutoff(context_limit, compaction_threshold)
         });
 
+        let mut extra_operations: Vec<Arc<dyn Operation<Session, GooseEffect>>> =
+            settings.auto_effort.into_iter().collect();
+        extra_operations.push(Arc::new(TaskNotificationOperation::new(
+            self.task_registry.clone(),
+        )));
+
         build_state_machine(StateMachineConfig {
             provider,
             model_config,
@@ -762,7 +784,7 @@ impl StateMachineServices {
             on_failure_timeout: settings.on_failure_timeout,
             stop_hook_block_cap: settings.stop_hook_block_cap,
             max_turns,
-            extra_operations: settings.auto_effort.into_iter().collect(),
+            extra_operations,
             cancel,
             context_relevance: settings.context_relevance,
         })

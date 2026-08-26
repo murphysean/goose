@@ -520,6 +520,7 @@ mod tests {
             providers: manager.get_context().providers.clone(),
             session_manager: manager.get_context().session_manager.clone(),
             scheduler: None,
+            task_registry: manager.get_context().task_registry.clone(),
         })
         .unwrap()
     }

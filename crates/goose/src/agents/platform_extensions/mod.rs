@@ -14,6 +14,7 @@ mod javascript;
 pub mod scheduler;
 pub mod summarize;
 pub mod summon;
+pub mod tasks;
 pub mod todo;
 pub mod tom;
 
@@ -151,6 +152,20 @@ pub static PLATFORM_EXTENSIONS: Lazy<HashMap<&'static str, PlatformExtensionDef>
             },
         );
 
+        map.insert(
+            tasks::EXTENSION_NAME,
+            PlatformExtensionDef {
+                name: tasks::EXTENSION_NAME,
+                display_name: "Tasks",
+                description:
+                    "Start and manage long-running background processes with stdin/stdout interaction",
+                default_enabled: true,
+                unprefixed_tools: false,
+                hidden: false,
+                client_factory: |ctx| Some(Box::new(tasks::TasksClient::new(ctx).unwrap())),
+            },
+        );
+
         #[cfg(feature = "code-mode")]
         map.insert(
             code_execution::EXTENSION_NAME,
@@ -224,6 +239,7 @@ pub struct PlatformExtensionContext {
     pub providers: std::sync::Arc<crate::agents::provider_manager::ProviderManager>,
     pub session_manager: std::sync::Arc<crate::session::SessionManager>,
     pub scheduler: Option<std::sync::Arc<dyn crate::scheduler_trait::SchedulerTrait>>,
+    pub task_registry: crate::tasks::SharedTaskRegistry,
 }
 
 impl PlatformExtensionContext {

@@ -818,6 +818,7 @@ mod tests {
                 providers: Default::default(),
                 session_manager: Arc::new(SessionManager::new(apps_dir.join("sessions"))),
                 scheduler: None,
+                task_registry: crate::tasks::create_task_registry().0,
             },
             apps_dir,
         }

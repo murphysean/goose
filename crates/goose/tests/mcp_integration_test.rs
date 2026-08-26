@@ -108,6 +108,7 @@ async fn fixture(mcpui: bool, protocol_version: Option<ProtocolVersion>) -> Fixt
                 protocol_version,
             },
         },
+        goose::tasks::create_task_registry().0,
     ));
     Fixture {
         manager,
@@ -928,6 +929,7 @@ async fn test_replayed_session(
                 protocol_version: None,
             },
         },
+        goose::tasks::create_task_registry().0,
     ));
 
     #[allow(clippy::redundant_closure_call)]

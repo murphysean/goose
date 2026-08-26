@@ -679,6 +679,7 @@ impl ExtensionManager {
         session_manager: Arc<crate::session::SessionManager>,
         scheduler: Option<Arc<dyn crate::scheduler_trait::SchedulerTrait>>,
         default_client: ClientContext,
+        task_registry: crate::tasks::SharedTaskRegistry,
     ) -> Self {
         Self {
             scopes: Mutex::new(HashMap::new()),
@@ -688,6 +689,7 @@ impl ExtensionManager {
                 providers,
                 session_manager,
                 scheduler,
+                task_registry,
             },
             default_client: Arc::new(default_client),
             clients: std::sync::Mutex::new(HashMap::new()),
@@ -696,11 +698,13 @@ impl ExtensionManager {
 
     pub fn with_data_dir(data_dir: std::path::PathBuf) -> Self {
         let session_manager = Arc::new(crate::session::SessionManager::new(data_dir));
+        let (task_registry, _) = crate::tasks::create_task_registry();
         Self::new(
             Default::default(),
             session_manager,
             None,
             ClientContext::new(&GoosePlatform::GooseCli, None),
+            task_registry,
         )
     }
 
