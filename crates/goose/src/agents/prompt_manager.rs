@@ -543,6 +543,7 @@ mod tests {
             scheduler: Some(scheduler),
             session: Some(Arc::new(session)),
             use_login_shell_path: false,
+            task_registry: crate::tasks::create_task_registry().0,
         };
 
         let mut extensions: Vec<ExtensionInfo> = PLATFORM_EXTENSIONS

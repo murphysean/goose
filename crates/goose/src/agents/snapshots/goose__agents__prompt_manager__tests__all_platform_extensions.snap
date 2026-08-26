@@ -136,6 +136,10 @@ You have these skills at your disposal, when it is clear they can help you solve
 ## summon
 
 
+## tasks
+
+### Instructions
+Unified task management for processes, timers, and subagents. Use start_task to create any kind of task, send_input to send data or signals, read_output to read results, and cancel_task/list_tasks/get_task to manage lifecycle.
 ## todo
 
 ### Instructions

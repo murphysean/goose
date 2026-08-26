@@ -576,6 +576,7 @@ mod tests {
             scheduler: None,
             session: None,
             use_login_shell_path: false,
+            task_registry: manager.get_context().task_registry.clone(),
         })
         .unwrap()
     }

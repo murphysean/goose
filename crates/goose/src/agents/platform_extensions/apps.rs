@@ -837,6 +837,7 @@ mod tests {
                 scheduler: None,
                 session: None,
                 use_login_shell_path: false,
+                task_registry: crate::tasks::create_task_registry().0,
             },
             apps_dir,
         }

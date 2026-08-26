@@ -99,7 +99,7 @@ fn unix_shell_command_args(command_line: &str) -> [&str; 2] {
 /// so callers only ever provide a bare executable path or name — see that
 /// function for the flag mapping.
 #[cfg(windows)]
-fn windows_shell() -> String {
+pub(crate) fn windows_shell() -> String {
     std::env::var("GOOSE_SHELL").unwrap_or_else(|_| "cmd".to_string())
 }
 
@@ -144,7 +144,7 @@ pub fn shell_display_name() -> String {
 /// to `sh`. Users who really want their login shell can opt in via
 /// `GOOSE_SHELL`.
 #[cfg(not(windows))]
-fn unix_shell() -> String {
+pub(crate) fn unix_shell() -> String {
     if let Ok(shell) = std::env::var("GOOSE_SHELL") {
         return shell;
     }
@@ -155,10 +155,10 @@ fn unix_shell() -> String {
     }
 }
 
-const OUTPUT_LIMIT_LINES: usize = 2000;
+pub const OUTPUT_LIMIT_LINES: usize = 2000;
 pub const OUTPUT_LIMIT_BYTES: usize = 50_000;
-const OUTPUT_PREVIEW_LINES: usize = 50;
-const OUTPUT_PREVIEW_BYTES: usize = 10_000;
+pub const OUTPUT_PREVIEW_LINES: usize = 50;
+pub const OUTPUT_PREVIEW_BYTES: usize = 10_000;
 
 const OUTPUT_SLOTS: usize = 8;
 
