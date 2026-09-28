@@ -5237,7 +5237,7 @@ dependencies = [
  "pastey",
  "pctx_code_mode",
  "pem 4.0.0",
- "process-wrap",
+ "process-wrap 9.1.0",
  "pty-process",
  "rand 0.10.2",
  "rayon",
